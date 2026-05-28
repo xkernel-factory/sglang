@@ -56,6 +56,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -285,6 +286,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init),
+            # so dummy attention reads land on slot 0 instead of a stale
+            # req_to_token row left by an earlier replay.
+            self.req_pool_indices.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -524,6 +530,18 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
+def _ci_use_ascending_capture_order(server_args) -> bool:
+    """Whether CI + FA3 forces ascending cuda-graph capture (FA3 varlen IMA workaround, #26532)."""
+    if not envs.SGLANG_IS_IN_CI.get():
+        return False
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    return "fa3" in (
+        prefill_backend,
+        decode_backend,
+        server_args.speculative_draft_attention_backend,
+    )
+
+
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -567,7 +585,15 @@ class CudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
+        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
+        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
+        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
+        # layout and is intentionally excluded so the attn_tp-local
+        # num_token_non_padded adjustment still runs for it.
+        self.enable_prefill_cp = (
+            is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+        )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -807,11 +833,17 @@ class CudaGraphRunner:
                 self.model_runner.gpu_id,
                 empty_cache=False,
             )
-            # Reverse the order to enable better memory sharing across cuda graphs.
+            # Reverse for memory sharing; CI+FA3 uses ascending to dodge the
+            # FA3 varlen workspace-slot IMA (#26532).
+            bs_seq = (
+                list(self.capture_bs)
+                if _ci_use_ascending_capture_order(self.model_runner.server_args)
+                else list(reversed(self.capture_bs))
+            )
             capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
+                tqdm.tqdm(bs_seq)
                 if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
+                else iter(bs_seq)
             )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
@@ -928,7 +960,7 @@ class CudaGraphRunner:
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
-            and not self.dsa_enable_prefill_cp
+            and not self.enable_prefill_cp
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
@@ -1191,7 +1223,9 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
+            # Parameter name retained for API stability; semantically this is
+            # "any prefill-CP flavor enabled" (DSA CP or MLA CP).
+            dsa_enable_prefill_cp=self.enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )

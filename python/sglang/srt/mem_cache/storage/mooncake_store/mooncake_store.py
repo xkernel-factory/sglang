@@ -1,6 +1,7 @@
 import ctypes
 import json
 import logging
+import mmap
 import os
 import time
 import uuid
@@ -51,9 +52,10 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         for d in dims:
             size *= d
         size *= torch.tensor([], dtype=self.dtype).element_size()
-        ptr_int = self.allocator.alloc(size)
+        alloc_size = ((size + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+        ptr_int = self.allocator.alloc(alloc_size)
         self.ptr = ptr_int
-        c_type = ctypes.c_byte * size
+        c_type = ctypes.c_byte * alloc_size
         c_array = c_type.from_address(ptr_int)
 
         tensor = torch.frombuffer(c_array, dtype=torch.uint8, count=size)
@@ -839,7 +841,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )

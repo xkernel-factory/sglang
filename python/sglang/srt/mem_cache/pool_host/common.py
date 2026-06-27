@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import mmap
 from collections import defaultdict
 
 import torch
@@ -47,12 +48,14 @@ def get_allocator_from_storage(allocator_type):
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    register_bytes = ((n_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), register_bytes, 0)
     if int(rc) != 0:
         raise RuntimeError(
             f"cudaHostRegister failed (rc={int(rc)}, "
             f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
+            f"size={register_bytes} (tensor_bytes={n_bytes}); host buffer is "
+            f"not pinned and device transfers "
             f"may silently return stale data."
         )
 

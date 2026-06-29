@@ -138,6 +138,7 @@ class HiSparseCoordinator:
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
+        self.ready_reqs: List[Req] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -534,12 +535,11 @@ class HiSparseCoordinator:
             ] = canonical_indices.to(device=self.device, non_blocking=True)
 
     def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
+        return len(self.ack_staging_queue) > 0 or len(self.ready_reqs) > 0
 
-    def collect_ready_reqs(self) -> List[Req]:
-        ready_reqs: List[Req] = []
+    def _num_finished_staging_reqs(self) -> int:
         if len(self.ack_staging_queue) == 0:
-            return ready_reqs
+            return 0
 
         finish_count = 0
         for _, finish_event, _ in self.ack_staging_queue:
@@ -554,17 +554,26 @@ class HiSparseCoordinator:
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-        finish_count = int(queue_size.item())
+        return int(queue_size.item())
+
+    def reclaim_finished_staging_reqs(self) -> int:
+        finish_count = self._num_finished_staging_reqs()
+        reclaimed_count = finish_count
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
             self.alloc_device_buffer(req)
             if self.radix_cache is not None:
                 self._insert_prefill_into_radix_cache(req)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
-            ready_reqs.append(req)
+            self.ready_reqs.append(req)
+        return reclaimed_count
+
+    def collect_ready_reqs(self) -> List[Req]:
+        self.reclaim_finished_staging_reqs()
+        ready_reqs = self.ready_reqs
+        self.ready_reqs = []
         return ready_reqs
 
     def map_last_loc_to_buffer(
@@ -879,6 +888,11 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        if self.ready_reqs:
+            self.ready_reqs = [
+                ready_req for ready_req in self.ready_reqs if ready_req is not req
+            ]
+
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             self.decode_producer_stream.synchronize()

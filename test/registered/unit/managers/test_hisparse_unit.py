@@ -179,6 +179,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
+        self.coordinator.ready_reqs.clear()
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -643,6 +644,53 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_reclaim_finished_staging_releases_cold_hbm_before_decode(self):
+        """Finished staging should free non-hot HiSparse HBM before decode scheduling."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 2
+        req = _make_req("staging-reclaim", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+
+        hisparse_after_prefill = self.allocator.hisparse_attn_allocator.available_size()
+        self.coordinator.admit_request_into_staging(req)
+        self.assertTrue(req.hisparse_staging)
+
+        torch.cuda.synchronize()
+        self.assertEqual(self.coordinator.reclaim_finished_staging_reqs(), 1)
+
+        self.assertFalse(req.hisparse_staging)
+        self.assertTrue(self.coordinator.has_ongoing_staging())
+        self.assertEqual(self.coordinator.ready_reqs, [req])
+        self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]),
+            self.coordinator.padded_buffer_size,
+        )
+        self.assertGreater(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            hisparse_after_prefill,
+        )
+
+        ready = self.coordinator.collect_ready_reqs()
+        self.assertEqual(ready, [req])
+        self.assertEqual(self.coordinator.ready_reqs, [])
+        self.assertFalse(self.coordinator.has_ongoing_staging())
+
+        tokens = self._build_topk_tokens(fill_len - 1)
+        batch = tokens.unsqueeze(0)
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id=0)
+        self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
+        self._assert_matches_naive(
+            rpi, sls, batch, locs, layer_id=0, msg="Staging reclaim: "
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "staging_reclaim")
 
     # ==================================================================
     # Test: Single-node staging host page allocation

@@ -2779,6 +2779,9 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.check_hicache_events()
+        if self.enable_hisparse:
+            if self.hisparse_coordinator.reclaim_finished_staging_reqs() > 0:
+                self.running_batch.batch_is_full = False
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.

@@ -542,7 +542,6 @@ class SchedulerMetricsReporter:
         self.last_input_throughput = (
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
-
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
@@ -725,7 +724,6 @@ class SchedulerMetricsReporter:
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 

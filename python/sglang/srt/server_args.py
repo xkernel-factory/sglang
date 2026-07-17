@@ -718,6 +718,68 @@ class ServerArgs:
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    enable_slo_aware_prefill: A[
+        bool,
+        "Enable an experimental SLO-aware controller that dynamically adjusts chunked prefill admission based on TTFT/TPOT pressure.",
+    ] = False
+    slo_prefill_ttft_slo_ms: A[
+        Optional[float],
+        "TTFT SLO in milliseconds for --enable-slo-aware-prefill.",
+    ] = None
+    slo_prefill_tpot_slo_ms: A[
+        Optional[float],
+        "TPOT SLO in milliseconds for --enable-slo-aware-prefill.",
+    ] = None
+    slo_prefill_ttft_stat: A[
+        str,
+        Arg(
+            help="Statistic used to aggregate TTFT pressure for --enable-slo-aware-prefill.",
+            choices=["max", "mean", "p90"],
+        ),
+    ] = "max"
+    slo_prefill_tpot_stat: A[
+        str,
+        Arg(
+            help="Statistic used to aggregate TPOT pressure for --enable-slo-aware-prefill.",
+            choices=["max", "mean", "p90"],
+        ),
+    ] = "max"
+    slo_prefill_initial_prefill_cost_ms_per_1k: A[
+        Optional[float],
+        "Warm-start prefill cost for --enable-slo-aware-prefill in milliseconds per 1K input tokens.",
+    ] = None
+    slo_prefill_initial_decode_cost_ms: A[
+        Optional[float],
+        "Warm-start decode iteration cost for --enable-slo-aware-prefill in milliseconds.",
+    ] = None
+    disable_slo_prefill_startup_profiling: A[
+        bool,
+        "Disable startup forward profiling for SLO-aware prefill Cp/Cd cost tables.",
+    ] = False
+    slo_prefill_profile_decode_context_len: A[
+        int,
+        "Synthetic context length per request for startup SLO decode Cd profiling when context length buckets are not specified.",
+    ] = 128
+    slo_prefill_profile_decode_context_lens: A[
+        Optional[List[int]],
+        "Synthetic context length buckets per request for startup SLO decode Cd profiling.",
+    ] = None
+    slo_prefill_profile_decode_batch_sizes: A[
+        Optional[List[int]],
+        "Explicit decode batch sizes for startup SLO Cd profiling. Defaults to captured decode cuda graph sizes.",
+    ] = None
+    slo_prefill_yield_guard_ratio: A[
+        float,
+        "Safety guard as a fraction of TTFT SLO for SLO-aware decode-yield slack checks.",
+    ] = 0.05
+    slo_prefill_cache_hit_io_cost_ratio: A[
+        float,
+        "IO cost multiplier for future cache-hit tokens in SLO TTFT future prefill cost estimation.",
+    ] = 0.3
+    slo_prefill_min_chunk_size: A[
+        Optional[int],
+        "Minimum chunk size for --enable-slo-aware-prefill when TPOT pressure still requires a prefill step. Defaults to the effective chunked prefill size.",
+    ] = None
     schedule_policy: A[
         str,
         Arg(
@@ -6443,6 +6505,71 @@ class ServerArgs:
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view
+
+        if self.enable_slo_aware_prefill:
+            if self.slo_prefill_ttft_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-ttft-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.slo_prefill_tpot_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-tpot-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.slo_prefill_ttft_slo_ms <= 0:
+                raise ValueError("--slo-prefill-ttft-slo-ms must be positive.")
+            if self.slo_prefill_tpot_slo_ms <= 0:
+                raise ValueError("--slo-prefill-tpot-slo-ms must be positive.")
+            if self.slo_prefill_ttft_stat not in ("max", "mean", "p90"):
+                raise ValueError(
+                    "--slo-prefill-ttft-stat must be one of max, mean, p90."
+                )
+            if self.slo_prefill_tpot_stat not in ("max", "mean", "p90"):
+                raise ValueError(
+                    "--slo-prefill-tpot-stat must be one of max, mean, p90."
+                )
+            if (
+                self.slo_prefill_initial_prefill_cost_ms_per_1k is not None
+                and self.slo_prefill_initial_prefill_cost_ms_per_1k <= 0
+            ):
+                raise ValueError(
+                    "--slo-prefill-initial-prefill-cost-ms-per-1k must be positive."
+                )
+            if (
+                self.slo_prefill_initial_decode_cost_ms is not None
+                and self.slo_prefill_initial_decode_cost_ms <= 0
+            ):
+                raise ValueError("--slo-prefill-initial-decode-cost-ms must be positive.")
+            if self.slo_prefill_profile_decode_context_len <= 0:
+                raise ValueError(
+                    "--slo-prefill-profile-decode-context-len must be positive."
+                )
+            if self.slo_prefill_profile_decode_context_lens is not None and any(
+                context_len <= 0
+                for context_len in self.slo_prefill_profile_decode_context_lens
+            ):
+                raise ValueError(
+                    "--slo-prefill-profile-decode-context-lens values must be positive."
+                )
+            if self.slo_prefill_yield_guard_ratio < 0:
+                raise ValueError("--slo-prefill-yield-guard-ratio must be non-negative.")
+            if self.slo_prefill_cache_hit_io_cost_ratio < 0:
+                raise ValueError(
+                    "--slo-prefill-cache-hit-io-cost-ratio must be non-negative."
+                )
+            if self.slo_prefill_profile_decode_batch_sizes is not None and any(
+                batch_size <= 0
+                for batch_size in self.slo_prefill_profile_decode_batch_sizes
+            ):
+                raise ValueError(
+                    "--slo-prefill-profile-decode-batch-sizes values must be positive."
+                )
+            if (
+                self.slo_prefill_min_chunk_size is not None
+                and self.slo_prefill_min_chunk_size <= 0
+            ):
+                raise ValueError("--slo-prefill-min-chunk-size must be positive.")
 
         # Handle optimistic prefill validation
         if (

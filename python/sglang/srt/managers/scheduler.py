@@ -72,7 +72,11 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -172,6 +176,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.slo_aware_prefill import (
+    SloAwarePrefillController,
+    SloAwarePrefillPressureState,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -238,7 +246,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -543,6 +551,12 @@ class Scheduler(
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
+
+        if (
+            self.slo_prefill_controller is not None
+            and not self.server_args.disable_slo_prefill_startup_profiling
+        ):
+            self._profile_slo_prefill_costs()
 
         self.init_pool_stats_observer()
 
@@ -1034,7 +1048,65 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
+        self.slo_prefill_controller: Optional[SloAwarePrefillController] = None
+        self.slo_prefill_log_interval = max(self.server_args.decode_log_interval, 1)
+        self.slo_prefill_log_ct = 0
         self.max_prefill_bs: int = 0
+        if self.server_args.enable_slo_aware_prefill:
+            if self.server_args.slo_prefill_ttft_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-ttft-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            if self.server_args.slo_prefill_tpot_slo_ms is None:
+                raise ValueError(
+                    "--slo-prefill-tpot-slo-ms is required when "
+                    "--enable-slo-aware-prefill is set."
+                )
+            self.slo_prefill_controller = SloAwarePrefillController(
+                ttft_slo_ms=self.server_args.slo_prefill_ttft_slo_ms,
+                tpot_slo_ms=self.server_args.slo_prefill_tpot_slo_ms,
+                base_chunked_prefill_size=self.chunked_prefill_size,
+                max_prefill_tokens=self.max_prefill_tokens,
+                page_size=self.page_size,
+                min_chunk_size=self.server_args.slo_prefill_min_chunk_size,
+                ttft_stat=self.server_args.slo_prefill_ttft_stat,
+                tpot_stat=self.server_args.slo_prefill_tpot_stat,
+                initial_prefill_cost_ms_per_1k=(
+                    self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k
+                ),
+                initial_decode_cost_ms=(
+                    self.server_args.slo_prefill_initial_decode_cost_ms
+                ),
+                yield_guard_ratio=self.server_args.slo_prefill_yield_guard_ratio,
+                cache_hit_io_cost_ratio=(
+                    self.server_args.slo_prefill_cache_hit_io_cost_ratio
+                ),
+            )
+            logger.info(
+                "SLO-aware prefill enabled: "
+                f"ttft_slo_ms={self.server_args.slo_prefill_ttft_slo_ms}, "
+                f"tpot_slo_ms={self.server_args.slo_prefill_tpot_slo_ms}, "
+                f"ttft_stat={self.server_args.slo_prefill_ttft_stat}, "
+                f"tpot_stat={self.server_args.slo_prefill_tpot_stat}, "
+                f"base_chunked_prefill_size={self.chunked_prefill_size}, "
+                f"initial_prefill_cost_ms_per_1k="
+                f"{self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k}, "
+                f"initial_decode_cost_ms="
+                f"{self.server_args.slo_prefill_initial_decode_cost_ms}, "
+                f"startup_profiling="
+                f"{not self.server_args.disable_slo_prefill_startup_profiling}, "
+                f"profile_decode_context_lens="
+                f"{self._slo_profile_decode_context_lens_arg()}, "
+                f"yield_guard_ratio={self.server_args.slo_prefill_yield_guard_ratio}, "
+                f"cache_hit_io_cost_ratio="
+                f"{self.server_args.slo_prefill_cache_hit_io_cost_ratio}, "
+                f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
+                f"effective_min_chunk_size="
+                f"{self.slo_prefill_controller.min_chunk_size}, "
+                f"dp_attention={self.server_args.enable_dp_attention}, "
+                f"hicache={self.enable_hicache_storage}"
+            )
         if self.server_args.enable_prefill_delayer:
             if self.server_args.disaggregation_mode == "decode":
                 logger.info(
@@ -2844,6 +2916,77 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        prefill_max_requests = self.server_args.prefill_max_requests
+        if self.slo_prefill_controller is not None:
+            slo_prefill_pressure_state = (
+                self.slo_prefill_controller.compute_pressure_state(
+                    waiting_queue=self.waiting_queue,
+                    running_batch=self.running_batch,
+                    chunked_req=self.chunked_req,
+                )
+            )
+            slo_prefill_pressure_state = self._sync_slo_prefill_pressure_state(
+                slo_prefill_pressure_state
+            )
+            slo_prefill_decision = (
+                self.slo_prefill_controller.make_decision_from_pressure_state(
+                    pressure_state=slo_prefill_pressure_state,
+                    chunked_req=self.chunked_req,
+                    default_chunked_prefill_size=chunked_prefill_size,
+                    default_prefill_max_requests=prefill_max_requests,
+                )
+            )
+            self.slo_prefill_log_ct += 1
+            should_log_slo_prefill = (
+                self.slo_prefill_log_ct % self.slo_prefill_log_interval == 0
+            )
+            if should_log_slo_prefill:
+                logger.info(
+                    "SLO prefill decision: "
+                    f"objective={slo_prefill_decision.objective}, "
+                    f"allow={slo_prefill_decision.allow_prefill}, "
+                    f"yield_to_decode={slo_prefill_decision.yield_prefill_to_decode}, "
+                    f"has_decode={slo_prefill_decision.has_decode_work}, "
+                    f"chunk={slo_prefill_decision.chunked_prefill_size}, "
+                    f"prefill_max_requests={slo_prefill_decision.max_prefill_requests}, "
+                    f"ttft_stat={slo_prefill_decision.ttft_stat}, "
+                    f"tpot_stat={slo_prefill_decision.tpot_stat}, "
+                    f"ttft_pressure={slo_prefill_decision.ttft_pressure:.3f}, "
+                    f"tpot_pressure={slo_prefill_decision.tpot_pressure:.3f}, "
+                    f"prefill_cost_ms_per_1k="
+                    f"{slo_prefill_decision.prefill_cost_per_token_s * 1e6:.3f}, "
+                    f"decode_cost_ms={slo_prefill_decision.decode_cost_s * 1e3:.3f}, "
+                    f"decode_context_len={slo_prefill_decision.decode_context_len}, "
+                    f"ttft_future_cost_ms="
+                    f"{slo_prefill_decision.ttft_future_prefill_cost_s * 1e3:.3f}, "
+                    f"ttft_future_miss_tokens="
+                    f"{slo_prefill_decision.ttft_future_miss_tokens}, "
+                    f"ttft_future_hit_tokens="
+                    f"{slo_prefill_decision.ttft_future_hit_tokens}, "
+                    f"ttft_future_io_cost_ms="
+                    f"{slo_prefill_decision.ttft_future_io_cost_s * 1e3:.3f}, "
+                    f"cache_hit_io_cost_ratio="
+                    f"{self.server_args.slo_prefill_cache_hit_io_cost_ratio:.3f}, "
+                    f"ttft_cache_hit_rate="
+                    f"{slo_prefill_decision.ttft_cache_hit_rate:.3f}, "
+                    f"ttft_slack_ms={slo_prefill_decision.ttft_slack_s * 1e3:.3f}, "
+                    f"yield_rhs_ms={slo_prefill_decision.yield_rhs_s * 1e3:.3f}, "
+                    f"yield_guard_ms={slo_prefill_decision.yield_guard_s * 1e3:.3f}, "
+                    f"min_prefill_cost_ms="
+                    f"{slo_prefill_decision.min_prefill_cost_s * 1e3:.3f}, "
+                    f"waiting={len(self.waiting_queue)}, "
+                    f"running={len(self.running_batch.reqs)}"
+                )
+            if (
+                slo_prefill_decision.yield_prefill_to_decode
+                and self.chunked_req is not None
+            ):
+                return None, running_batch
+            if not slo_prefill_decision.allow_prefill:
+                return None, running_batch
+            chunked_prefill_size = slo_prefill_decision.chunked_prefill_size
+            prefill_max_requests = slo_prefill_decision.max_prefill_requests
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2857,7 +3000,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -3217,6 +3360,395 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def _sync_slo_prefill_pressure_state(
+        self, pressure_state: SloAwarePrefillPressureState
+    ) -> SloAwarePrefillPressureState:
+        pressure_tensor = torch.tensor(
+            [
+                pressure_state.ttft_pressure,
+                pressure_state.tpot_pressure,
+                1.0 if pressure_state.has_decode_work else 0.0,
+                pressure_state.prefill_cost_per_token_s,
+                pressure_state.decode_cost_s,
+                float(pressure_state.decode_context_len),
+                pressure_state.ttft_future_prefill_cost_s,
+                float(pressure_state.ttft_future_miss_tokens),
+                float(pressure_state.ttft_future_hit_tokens),
+                pressure_state.ttft_future_io_cost_s,
+                pressure_state.ttft_cache_hit_rate,
+            ],
+            dtype=torch.float32,
+        )
+        if self.server_args.enable_dp_attention:
+            sync_groups = (
+                (self.dp_tp_group, self.dp_tp_cpu_group),
+                (self.attn_cp_group, self.attn_cp_cpu_group),
+            )
+        else:
+            sync_groups = ((self.tp_group, self.tp_cpu_group),)
+        for sync_group, sync_cpu_group in sync_groups:
+            if sync_group.world_size == 1:
+                continue
+            torch.distributed.all_reduce(
+                pressure_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=sync_cpu_group,
+            )
+        return SloAwarePrefillPressureState(
+            ttft_pressure=float(pressure_tensor[0].item()),
+            tpot_pressure=float(pressure_tensor[1].item()),
+            has_decode_work=bool(pressure_tensor[2].item() > 0.0),
+            prefill_cost_per_token_s=float(pressure_tensor[3].item()),
+            decode_cost_s=float(pressure_tensor[4].item()),
+            decode_context_len=int(pressure_tensor[5].item()),
+            ttft_future_prefill_cost_s=float(pressure_tensor[6].item()),
+            ttft_future_miss_tokens=int(pressure_tensor[7].item()),
+            ttft_future_hit_tokens=int(pressure_tensor[8].item()),
+            ttft_future_io_cost_s=float(pressure_tensor[9].item()),
+            ttft_cache_hit_rate=float(pressure_tensor[10].item()),
+        )
+
+    def _profile_slo_prefill_costs(self) -> None:
+        if self.slo_prefill_controller is None:
+            return
+        if not self.is_generation:
+            logger.info(
+                "Skip SLO prefill startup cost profiling for non-generation model."
+            )
+            return
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            logger.info(
+                "Skip SLO prefill startup cost profiling in disaggregation mode: %s.",
+                self.disaggregation_mode.value,
+            )
+            return
+        if self.ps.pp_size > 1:
+            logger.info(
+                "Skip SLO prefill startup cost profiling for pipeline parallelism."
+            )
+            return
+        if not self.spec_algorithm.is_none():
+            logger.info(
+                "Skip SLO prefill startup cost profiling for speculative algorithm: %s.",
+                self.server_args.speculative_algorithm,
+            )
+            return
+
+        prefill_points: List[Tuple[int, float]] = []
+        decode_points: List[Tuple[int, int, float]] = []
+        try:
+            self._warmup_slo_profile_forward()
+            num_tokens = self._slo_profile_prefill_size()
+            if num_tokens > 0:
+                try:
+                    cost_ms = self._profile_slo_prefill_cost(num_tokens)
+                except Exception as exc:
+                    logger.warning(
+                        "SLO prefill startup Cp profiling failed for %d tokens: %s",
+                        num_tokens,
+                        exc,
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+                else:
+                    prefill_points.append((num_tokens, cost_ms))
+
+            for decode_context_len in self._slo_profile_decode_context_lens():
+                for batch_size in self._slo_profile_decode_batch_sizes(
+                    decode_context_len
+                ):
+                    try:
+                        cost_ms = self._profile_slo_decode_cost(
+                            batch_size, decode_context_len
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "SLO prefill startup Cd profiling failed for "
+                            "context_len=%d, batch_size=%d: %s",
+                            decode_context_len,
+                            batch_size,
+                            exc,
+                            exc_info=logger.isEnabledFor(logging.DEBUG),
+                        )
+                        continue
+                    decode_points.append((decode_context_len, batch_size, cost_ms))
+        except Exception as exc:
+            logger.warning(
+                "SLO prefill startup cost profiling failed; fallback to initial/default cost model: %s",
+                exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return
+
+        if not prefill_points and not decode_points:
+            logger.warning(
+                "SLO prefill startup cost profiling produced no samples; "
+                "fallback to initial/default cost model."
+            )
+            return
+
+        self.slo_prefill_controller.set_startup_cost_profile(
+            prefill_cost_ms=prefill_points,
+            decode_cost_by_context_ms=decode_points,
+        )
+        logger.info(
+            "SLO prefill startup cost profile: Cp(ms)=%s, "
+            "Cd_mean(ms)=%s, Cd_warmup=%d, Cd_samples=%d",
+            [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
+            self._format_slo_decode_cost_points(decode_points),
+            self._slo_decode_profile_warmup_iters(),
+            self._slo_decode_profile_sample_iters(),
+        )
+
+    def _warmup_slo_profile_forward(self) -> None:
+        size = self._slo_profile_prefill_size()
+        if size <= 0:
+            return
+        try:
+            self._profile_slo_prefill_cost(size)
+        except Exception as exc:
+            logger.debug("SLO prefill startup warmup failed: %s", exc, exc_info=True)
+
+    def _slo_profile_prefill_size(self) -> int:
+        assert self.slo_prefill_controller is not None
+        upper = self.slo_prefill_controller.min_chunk_size
+        return max(
+            1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1)
+        )
+
+    def _slo_profile_decode_context_lens_arg(self) -> List[int]:
+        return self.server_args.slo_prefill_profile_decode_context_lens or [
+            self.server_args.slo_prefill_profile_decode_context_len
+        ]
+
+    def _slo_profile_decode_context_lens(self) -> List[int]:
+        explicit_lens = self.server_args.slo_prefill_profile_decode_context_lens
+        raw_lens = (
+            explicit_lens
+            if explicit_lens is not None
+            else [self.server_args.slo_prefill_profile_decode_context_len]
+        )
+        max_context_len = max(
+            1, min(self.max_req_input_len - 1, self.max_total_num_tokens - 1)
+        )
+        return sorted(
+            set(
+                max(1, min(int(context_len), max_context_len))
+                for context_len in raw_lens
+            )
+        )
+
+    def _format_slo_decode_cost_points(
+        self, decode_points: List[Tuple[int, int, float]]
+    ) -> List[Tuple[int, List[Tuple[int, float]]]]:
+        grouped: dict[int, List[Tuple[int, float]]] = {}
+        for context_len, batch_size, cost_ms in decode_points:
+            grouped.setdefault(context_len, []).append((batch_size, round(cost_ms, 3)))
+        return [
+            (context_len, sorted(points))
+            for context_len, points in sorted(grouped.items())
+        ]
+
+    def _slo_profile_decode_batch_sizes(self, context_len: int) -> List[int]:
+        explicit_sizes = self.server_args.slo_prefill_profile_decode_batch_sizes
+        if explicit_sizes is not None:
+            raw_sizes = explicit_sizes
+        else:
+            decode_config = self.server_args.cuda_graph_config.decode
+            if decode_config.bs:
+                raw_sizes = decode_config.bs
+            else:
+                raw_sizes = self.server_args._generate_decode_cuda_graph_batch_sizes(
+                    decode_config.max_bs or self.max_running_requests
+                )
+
+        max_by_tokens = max(1, self.max_total_num_tokens // max(context_len + 1, 1))
+        max_by_req_slots = max(1, self.req_to_token_pool.available_size())
+        max_batch_size = max(
+            1, min(self.max_running_requests, max_by_tokens, max_by_req_slots)
+        )
+        sizes = sorted(
+            set(int(size) for size in raw_sizes if 0 < int(size) <= max_batch_size)
+        )
+        if 1 not in sizes:
+            sizes.insert(0, 1)
+        return sizes
+
+    def _profile_slo_prefill_cost(self, num_tokens: int) -> float:
+        req = self._new_slo_profile_req(f"prefill-{num_tokens}", num_tokens)
+        try:
+            batch = self._new_slo_profile_batch([req])
+            batch.prepare_for_extend()
+            batch = self._prepare_slo_profile_forward_batch(batch)
+            return self._run_slo_profile_forward(batch)
+        finally:
+            self._release_slo_profile_reqs([req])
+
+    def _slo_decode_profile_warmup_iters(self) -> int:
+        return 1
+
+    def _slo_decode_profile_sample_iters(self) -> int:
+        return 10
+
+    def _profile_slo_decode_cost(self, batch_size: int, context_len: int) -> float:
+        reqs = [
+            self._new_slo_profile_req(f"decode-{batch_size}-{i}", context_len)
+            for i in range(batch_size)
+        ]
+        try:
+            batch = self._new_slo_profile_batch(reqs)
+            batch.prepare_for_extend()
+            batch = self._prepare_slo_profile_forward_batch(batch)
+            self._run_slo_profile_forward(batch)
+
+            last_tokens = []
+            for req in reqs:
+                token_id = req.origin_input_ids[-1]
+                req.output_ids.append(token_id)
+                req._refresh_fill_ids()
+                last_tokens.append(token_id)
+            bonus_tokens = torch.tensor(
+                last_tokens, dtype=torch.int64, device=self.device
+            )
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=bonus_tokens)
+            )
+            batch.prepare_for_decode()
+            batch = self._prepare_slo_profile_forward_batch(batch)
+
+            for _ in range(self._slo_decode_profile_warmup_iters()):
+                self._run_slo_profile_decode_forward(batch, bonus_tokens)
+
+            sample_costs_ms = [
+                self._run_slo_profile_decode_forward(batch, bonus_tokens)
+                for _ in range(self._slo_decode_profile_sample_iters())
+            ]
+            return sum(sample_costs_ms) / len(sample_costs_ms)
+        finally:
+            self._release_slo_profile_reqs(reqs)
+
+    def _run_slo_profile_decode_forward(
+        self, batch: ScheduleBatch, bonus_tokens: torch.Tensor
+    ) -> float:
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=bonus_tokens)
+        )
+        batch.input_ids = None
+        return self._run_slo_profile_forward(batch)
+
+    def _new_slo_profile_req(self, rid: str, num_tokens: int) -> Req:
+        vocab_size = max(int(self.model_config.vocab_size or 32000), 2)
+        ids = array("q", ((i % (vocab_size - 1)) + 1 for i in range(num_tokens)))
+        sampling_params = SamplingParams(temperature=0.0, max_new_tokens=1)
+        req = Req(
+            rid=f"__slo_profile_{rid}",
+            origin_input_text="",
+            origin_input_ids=ids,
+            sampling_params=sampling_params,
+            vocab_size=vocab_size,
+        )
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.logprob_start_len = -1
+        req.skip_radix_cache_insert = True
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        return req
+
+    def _new_slo_profile_batch(self, reqs: List[Req]) -> ScheduleBatch:
+        return ScheduleBatch.init_new(
+            reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            False,
+            self.spec_algorithm,
+            dllm_config=self.dllm_config,
+        )
+
+    def _prepare_slo_profile_forward_batch(
+        self, batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        if self.require_mlp_sync:
+            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                batch, need_sync=True
+            )
+        elif is_dp_attention_enabled():
+            num_tokens = (
+                batch.batch_size()
+                if batch.forward_mode.is_decode()
+                else batch.extend_num_tokens
+            )
+            global_num_tokens = [num_tokens] * get_attention_dp_size()
+            batch.global_num_tokens = global_num_tokens
+            batch.global_num_tokens_for_logprob = global_num_tokens
+        ngram_manager = getattr(self, "ngram_embedding_manager", None)
+        if ngram_manager is not None:
+            batch = ngram_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
+        return batch
+
+    def _run_slo_profile_forward(self, batch: ScheduleBatch) -> float:
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        self._synchronize_slo_profile_device()
+        start = time.perf_counter()
+        with torch.inference_mode(), self._forward_isolation(batch, overlap=False):
+            resolve_forward_inputs(batch, self.future_map)
+            self.model_worker.forward_batch_generation(batch)
+        self._synchronize_slo_profile_device()
+        batch.input_ids = None
+        return (time.perf_counter() - start) * 1e3
+
+    def _synchronize_slo_profile_device(self) -> None:
+        synchronize = getattr(
+            torch.get_device_module(self.device), "synchronize", None
+        )
+        if synchronize is not None:
+            synchronize()
+
+    def _release_slo_profile_reqs(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            self._force_release_slo_profile_req(req)
+
+    def _force_release_slo_profile_req(self, req: Req) -> None:
+        if req.req_pool_idx is None:
+            return
+
+        req_pool_idx = req.req_pool_idx
+        try:
+            kv_len = max(req.kv_allocated_len, req.kv_committed_len, 0)
+            if kv_len > 0:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req_pool_idx, :kv_len
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+                self.req_to_token_pool, "free_mamba_cache"
+            ):
+                self.req_to_token_pool.free_mamba_cache(req)
+        except Exception as exc:
+            logger.debug(
+                "Failed to release SLO profile KV for %s: %s",
+                req.rid,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            if req.req_pool_idx is not None:
+                try:
+                    self.req_to_token_pool.free(req)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to release SLO profile req slot for %s: %s",
+                        req.rid,
+                        exc,
+                        exc_info=True,
+                    )
+            req.kv_allocated_len = 0
+            req.kv_committed_len = 0
+            req.kv_committed_freed = True
+            req.kv_overallocated_freed = True
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(

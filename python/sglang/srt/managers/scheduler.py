@@ -3428,13 +3428,6 @@ class Scheduler(
                 "Skip SLO prefill startup cost profiling for pipeline parallelism."
             )
             return
-        if not self.spec_algorithm.is_none():
-            logger.info(
-                "Skip SLO prefill startup cost profiling for speculative algorithm: %s.",
-                self.server_args.speculative_algorithm,
-            )
-            return
-
         prefill_points: List[Tuple[int, float]] = []
         decode_points: List[Tuple[int, int, float]] = []
         try:
@@ -3453,14 +3446,17 @@ class Scheduler(
                 else:
                     prefill_points.append((num_tokens, cost_ms))
 
+            profile_decode_cost = (
+                self._profile_slo_spec_decode_cost
+                if not self.spec_algorithm.is_none()
+                else self._profile_slo_decode_cost
+            )
             for decode_context_len in self._slo_profile_decode_context_lens():
                 for batch_size in self._slo_profile_decode_batch_sizes(
                     decode_context_len
                 ):
                     try:
-                        cost_ms = self._profile_slo_decode_cost(
-                            batch_size, decode_context_len
-                        )
+                        cost_ms = profile_decode_cost(batch_size, decode_context_len)
                     except Exception as exc:
                         logger.warning(
                             "SLO prefill startup Cd profiling failed for "
@@ -3491,14 +3487,29 @@ class Scheduler(
             prefill_cost_ms=prefill_points,
             decode_cost_by_context_ms=decode_points,
         )
-        logger.info(
-            "SLO prefill startup cost profile: Cp(ms)=%s, "
-            "Cd_mean(ms)=%s, Cd_warmup=%d, Cd_samples=%d",
-            [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
-            self._format_slo_decode_cost_points(decode_points),
-            self._slo_decode_profile_warmup_iters(),
-            self._slo_decode_profile_sample_iters(),
-        )
+        cd_log = self._format_slo_decode_cost_points(decode_points)
+        if not self.spec_algorithm.is_none():
+            verify_tokens = self._slo_profile_verify_num_draft_tokens()
+            logger.info(
+                "SLO prefill startup cost profile (spec decode): "
+                "algorithm=%s, verify_num_draft_tokens=%s, Cp(ms)=%s, "
+                "Cd_mean(ms)=%s, Cd_warmup=%d, Cd_samples=%d",
+                self.server_args.speculative_algorithm,
+                verify_tokens,
+                [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
+                cd_log,
+                self._slo_decode_profile_warmup_iters(),
+                self._slo_decode_profile_sample_iters(),
+            )
+        else:
+            logger.info(
+                "SLO prefill startup cost profile: Cp(ms)=%s, "
+                "Cd_mean(ms)=%s, Cd_warmup=%d, Cd_samples=%d",
+                [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
+                cd_log,
+                self._slo_decode_profile_warmup_iters(),
+                self._slo_decode_profile_sample_iters(),
+            )
 
     def _warmup_slo_profile_forward(self) -> None:
         size = self._slo_profile_prefill_size()
@@ -3636,6 +3647,76 @@ class Scheduler(
         batch.input_ids = None
         return self._run_slo_profile_forward(batch)
 
+    def _slo_profile_verify_num_draft_tokens(self) -> Optional[int]:
+        draft_tokens = self.server_args.speculative_num_draft_tokens
+        if draft_tokens is not None and draft_tokens > 0:
+            return int(draft_tokens)
+        num_steps = self.server_args.speculative_num_steps
+        if num_steps is not None and num_steps > 0:
+            return int(num_steps) + 1
+        return None
+
+    def _profile_slo_spec_decode_cost(
+        self, batch_size: int, context_len: int
+    ) -> float:
+        if self.draft_worker is None:
+            raise RuntimeError("Speculative SLO profiling requires draft_worker.")
+
+        reqs = [
+            self._new_slo_profile_req(
+                f"spec-decode-{batch_size}-{i}-{context_len}", context_len
+            )
+            for i in range(batch_size)
+        ]
+        try:
+            batch = self._new_slo_profile_batch(reqs)
+            batch.prepare_for_extend()
+            batch = self._prepare_slo_profile_forward_batch(batch)
+            _, prefill_result = self._run_slo_profile_forward_result(batch)
+            self._apply_slo_profile_spec_prefill_state(batch, prefill_result)
+            batch.prepare_for_decode()
+            batch = self._prepare_slo_profile_forward_batch(batch)
+
+            for _ in range(self._slo_decode_profile_warmup_iters()):
+                self._run_slo_profile_forward(batch)
+
+            sample_costs_ms = [
+                self._run_slo_profile_forward(batch)
+                for _ in range(self._slo_decode_profile_sample_iters())
+            ]
+            return sum(sample_costs_ms) / len(sample_costs_ms)
+        finally:
+            self._release_slo_profile_reqs(reqs)
+
+    def _apply_slo_profile_spec_prefill_state(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        if result.next_draft_input is None:
+            raise RuntimeError(
+                "Speculative SLO prefill profiling expected next_draft_input, got None."
+            )
+        next_token_ids = result.next_token_ids
+        if isinstance(next_token_ids, torch.Tensor):
+            next_token_ids = next_token_ids.tolist()
+        for i, req in enumerate(batch.reqs):
+            token_id = next_token_ids[i]
+            if isinstance(token_id, (list, tuple)):
+                req.output_ids.extend(token_id)
+            else:
+                req.output_ids.append(token_id)
+            if batch.seq_lens_cpu is not None:
+                committed = int(batch.seq_lens_cpu[i])
+            else:
+                committed = int(batch.seq_lens[i].item())
+            req.kv_committed_len = committed
+            req.kv_allocated_len = max(req.kv_allocated_len, committed)
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = result.new_seq_lens.cpu()
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
     def _new_slo_profile_req(self, rid: str, num_tokens: int) -> Req:
         vocab_size = max(int(self.model_config.vocab_size or 32000), 2)
         ids = array("q", ((i % (vocab_size - 1)) + 1 for i in range(num_tokens)))
@@ -3689,16 +3770,22 @@ class Scheduler(
         return batch
 
     def _run_slo_profile_forward(self, batch: ScheduleBatch) -> float:
+        elapsed_ms, _ = self._run_slo_profile_forward_result(batch)
+        return elapsed_ms
+
+    def _run_slo_profile_forward_result(
+        self, batch: ScheduleBatch
+    ) -> Tuple[float, GenerationBatchResult]:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         self._synchronize_slo_profile_device()
         start = time.perf_counter()
         with torch.inference_mode(), self._forward_isolation(batch, overlap=False):
             resolve_forward_inputs(batch, self.future_map)
-            self.model_worker.forward_batch_generation(batch)
+            result = self.model_worker.forward_batch_generation(batch)
         self._synchronize_slo_profile_device()
         batch.input_ids = None
-        return (time.perf_counter() - start) * 1e3
+        return (time.perf_counter() - start) * 1e3, result
 
     def _synchronize_slo_profile_device(self) -> None:
         synchronize = getattr(

@@ -609,6 +609,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
     last_decode_finish_time: float = 0.0
+    last_decode_accept_len: int = 1
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
@@ -825,10 +826,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     RequestStage.PREFILL_FORWARD, self.last_forward_entry_time, ts
                 )
 
-    def set_last_decode_finish_time(self, ts=None):
+    def set_last_decode_finish_time(self, ts=None, accept_len: int = 1):
         ts = ts or time.perf_counter()
         last_time = self.last_decode_finish_time
         self.last_decode_finish_time = ts
+        self.last_decode_accept_len = max(int(accept_len), 1)
 
         if self.enable_metrics or self.trace_ctx.tracing_enable:
             if last_time == 0.0:

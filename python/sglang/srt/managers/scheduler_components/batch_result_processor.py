@@ -709,7 +709,7 @@ class SchedulerBatchResultProcessor:
             new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
-            req.time_stats.set_last_decode_finish_time()
+            req.time_stats.set_last_decode_finish_time(accept_len=new_accept_len)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)

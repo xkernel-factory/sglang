@@ -578,9 +578,14 @@ class SloAwarePrefillController:
             last = req.time_stats.last_decode_finish_time or now
             if start > 0.0:
                 tpot_s = 0.0
+                last_accept_len = max(
+                    getattr(req.time_stats, "last_decode_accept_len", 1), 1
+                )
                 decode_anchor = req.time_stats.last_decode_finish_time or start
                 if now > decode_anchor:
-                    tpot_s = max(tpot_s, now - decode_anchor)
+                    tpot_s = max(
+                        tpot_s, (now - decode_anchor) / last_accept_len
+                    )
                 if last > start and len(req.output_ids) > 1:
                     decode_tokens = max(len(req.output_ids) - 1, 1)
                     tpot_s = max(tpot_s, (last - start) / decode_tokens)

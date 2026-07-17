@@ -23,6 +23,7 @@ class FakeReq:
         wait_s=0.0,
         prefill_finished_s=0.0,
         last_decode_finish_s=0.0,
+        last_decode_accept_len=1,
         output_len=0,
         seqlen=128,
         matched=0,
@@ -38,6 +39,7 @@ class FakeReq:
             last_decode_finish_time=(
                 now - last_decode_finish_s if last_decode_finish_s else 0.0
             ),
+            last_decode_accept_len=last_decode_accept_len,
         )
         self.output_ids = [0] * output_len
         self.seqlen = seqlen
@@ -167,6 +169,36 @@ class TestSloAwarePrefillController(unittest.TestCase):
         self.assertGreater(decision.tpot_pressure, 0.35)
         self.assertLess(decision.tpot_pressure, 0.70)
         self.assertEqual(decision.tpot_stat, "p90")
+
+    def test_decode_gap_normalizes_by_last_accept_len(self):
+        controller = SloAwarePrefillController(
+            ttft_slo_ms=1000,
+            tpot_slo_ms=100,
+            base_chunked_prefill_size=1024,
+            max_prefill_tokens=4096,
+            page_size=1,
+            min_chunk_size=None,
+        )
+        running = SimpleNamespace(
+            reqs=[
+                FakeReq(
+                    prefill_finished_s=0.2,
+                    last_decode_finish_s=0.08,
+                    last_decode_accept_len=4,
+                    output_len=1,
+                )
+            ]
+        )
+
+        decision = controller.make_decision(
+            waiting_queue=[],
+            running_batch=running,
+            chunked_req=None,
+            default_chunked_prefill_size=1024,
+            default_prefill_max_requests=None,
+        )
+
+        self.assertAlmostEqual(decision.tpot_pressure, 0.2, delta=0.05)
 
     def test_initial_costs_seed_default_costs(self):
         controller = SloAwarePrefillController(

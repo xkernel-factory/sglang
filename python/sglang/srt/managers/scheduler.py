@@ -177,6 +177,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.slo_aware_prefill import (
+    SloAwarePrefillDecision,
     SloAwarePrefillController,
     SloAwarePrefillPressureState,
 )
@@ -2936,6 +2937,9 @@ class Scheduler(
                     default_prefill_max_requests=prefill_max_requests,
                 )
             )
+            slo_prefill_decision = self._sync_slo_prefill_decision(
+                slo_prefill_decision
+            )
             self.slo_prefill_log_ct += 1
             should_log_slo_prefill = (
                 self.slo_prefill_log_ct % self.slo_prefill_log_interval == 0
@@ -3408,6 +3412,76 @@ class Scheduler(
             ttft_future_io_cost_s=float(pressure_tensor[9].item()),
             ttft_cache_hit_rate=float(pressure_tensor[10].item()),
         )
+
+    def _sync_slo_prefill_decision(
+        self, decision: SloAwarePrefillDecision
+    ) -> SloAwarePrefillDecision:
+        if self.slo_prefill_controller is None:
+            return decision
+
+        chunk = decision.chunked_prefill_size
+        max_reqs = decision.max_prefill_requests
+        local_decision = torch.tensor(
+            [
+                1 if decision.allow_prefill else 0,
+                1 if decision.yield_prefill_to_decode else 0,
+                int(chunk) if chunk is not None else -1,
+                int(max_reqs) if max_reqs is not None else -1,
+            ],
+            dtype=torch.int64,
+        )
+        if self.server_args.enable_dp_attention:
+            sync_groups = (
+                (self.dp_tp_group, self.dp_tp_cpu_group),
+                (self.attn_cp_group, self.attn_cp_cpu_group),
+            )
+        else:
+            sync_groups = ((self.tp_group, self.tp_cpu_group),)
+        for sync_group, sync_cpu_group in sync_groups:
+            if sync_group.world_size == 1:
+                continue
+            gathered = torch.empty(
+                (sync_group.world_size, local_decision.numel()),
+                dtype=local_decision.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered.flatten(), local_decision, group=sync_cpu_group
+            )
+
+            yield_prefill_to_decode = bool(torch.any(gathered[:, 1] > 0).item())
+            allow_prefill = bool(
+                torch.all(gathered[:, 0] > 0).item() and not yield_prefill_to_decode
+            )
+            chunk_values = gathered[:, 2]
+            chunk_values = chunk_values[chunk_values >= 0]
+            max_req_values = gathered[:, 3]
+            max_req_values = max_req_values[max_req_values >= 0]
+
+            synced_chunk = (
+                int(torch.min(chunk_values).item()) if chunk_values.numel() else -1
+            )
+            synced_max_reqs = (
+                int(torch.min(max_req_values).item()) if max_req_values.numel() else -1
+            )
+            local_decision = torch.tensor(
+                [
+                    1 if allow_prefill else 0,
+                    1 if yield_prefill_to_decode else 0,
+                    synced_chunk,
+                    synced_max_reqs,
+                ],
+                dtype=torch.int64,
+            )
+
+        decision.allow_prefill = bool(local_decision[0].item() > 0)
+        decision.yield_prefill_to_decode = bool(local_decision[1].item() > 0)
+        decision.chunked_prefill_size = (
+            int(local_decision[2].item()) if local_decision[2].item() >= 0 else None
+        )
+        decision.max_prefill_requests = (
+            int(local_decision[3].item()) if local_decision[3].item() >= 0 else None
+        )
+        return decision
 
     def _profile_slo_prefill_costs(self) -> None:
         if self.slo_prefill_controller is None:

@@ -5,6 +5,7 @@ import torch
 import sglang.srt.layers.moe.topk as topk_mod
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
+    fused_topk_torch_native,
     _can_fuse_padded_region,
     _fill_padded_rows,
     _mask_topk_ids_padded_region,
@@ -21,6 +22,36 @@ register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")
 _IS_HIP = is_hip()
 
 torch.manual_seed(1234)
+
+
+class TestFusedTopkTorchNative(CustomTestCase):
+    def test_correction_bias_flattens_leading_dims_for_gather(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        hidden_states = torch.empty((3, 4), device=device)
+        gating_output = torch.tensor(
+            [[[0.1, 0.9], [0.7, 0.2], [0.3, 0.8]]],
+            device=device,
+            dtype=torch.float32,
+        )
+        correction_bias = torch.tensor([0.0, 0.1], device=device)
+
+        topk_weights, topk_ids = fused_topk_torch_native(
+            hidden_states,
+            gating_output,
+            topk=1,
+            renormalize=False,
+            correction_bias=correction_bias,
+            scoring_func="sigmoid",
+        )
+
+        scores = gating_output.sigmoid().view(-1, gating_output.shape[-1])
+        expected_ids = torch.topk(
+            scores + correction_bias.unsqueeze(0), k=1, dim=-1, sorted=False
+        )[1]
+        expected_weights = scores.gather(1, expected_ids)
+
+        self.assertTrue(torch.equal(topk_ids, expected_ids))
+        torch.testing.assert_close(topk_weights, expected_weights)
 
 
 def _eager_fill_padded_rows(x, num_token_non_padded, fill_value):

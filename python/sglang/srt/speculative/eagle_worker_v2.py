@@ -873,12 +873,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
-            buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
-                -1,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            # SLO profiling can run the first draft-extend under torch.inference_mode().
+            # This buffer is mutated and reused by later eager forwards, which may run
+            # under no_grad instead; allocate it as a normal tensor in either case.
+            with torch.inference_mode(False), torch.no_grad():
+                buf = torch.full(
+                    (num_tokens, self.dsa_index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 

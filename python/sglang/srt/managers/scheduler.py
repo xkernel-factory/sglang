@@ -3421,12 +3421,13 @@ class Scheduler(
 
         chunk = decision.chunked_prefill_size
         max_reqs = decision.max_prefill_requests
+        unset_value = 1 << 60
         local_decision = torch.tensor(
             [
-                1 if decision.allow_prefill else 0,
+                0 if decision.allow_prefill else 1,
                 1 if decision.yield_prefill_to_decode else 0,
-                int(chunk) if chunk is not None else -1,
-                int(max_reqs) if max_reqs is not None else -1,
+                -int(chunk) if chunk is not None else -unset_value,
+                -int(max_reqs) if max_reqs is not None else -unset_value,
             ],
             dtype=torch.int64,
         )
@@ -3440,46 +3441,23 @@ class Scheduler(
         for sync_group, sync_cpu_group in sync_groups:
             if sync_group.world_size == 1:
                 continue
-            gathered = torch.empty(
-                (sync_group.world_size, local_decision.numel()),
-                dtype=local_decision.dtype,
-            )
-            torch.distributed.all_gather_into_tensor(
-                gathered.flatten(), local_decision, group=sync_cpu_group
+            torch.distributed.all_reduce(
+                local_decision,
+                op=torch.distributed.ReduceOp.MAX,
+                group=sync_cpu_group,
             )
 
-            yield_prefill_to_decode = bool(torch.any(gathered[:, 1] > 0).item())
-            allow_prefill = bool(
-                torch.all(gathered[:, 0] > 0).item() and not yield_prefill_to_decode
-            )
-            chunk_values = gathered[:, 2]
-            chunk_values = chunk_values[chunk_values >= 0]
-            max_req_values = gathered[:, 3]
-            max_req_values = max_req_values[max_req_values >= 0]
-
-            synced_chunk = (
-                int(torch.min(chunk_values).item()) if chunk_values.numel() else -1
-            )
-            synced_max_reqs = (
-                int(torch.min(max_req_values).item()) if max_req_values.numel() else -1
-            )
-            local_decision = torch.tensor(
-                [
-                    1 if allow_prefill else 0,
-                    1 if yield_prefill_to_decode else 0,
-                    synced_chunk,
-                    synced_max_reqs,
-                ],
-                dtype=torch.int64,
-            )
-
-        decision.allow_prefill = bool(local_decision[0].item() > 0)
+        decision.allow_prefill = bool(
+            local_decision[0].item() == 0 and local_decision[1].item() == 0
+        )
         decision.yield_prefill_to_decode = bool(local_decision[1].item() > 0)
+        chunk_value = -int(local_decision[2].item())
+        max_req_value = -int(local_decision[3].item())
         decision.chunked_prefill_size = (
-            int(local_decision[2].item()) if local_decision[2].item() >= 0 else None
+            chunk_value if chunk_value < unset_value else None
         )
         decision.max_prefill_requests = (
-            int(local_decision[3].item()) if local_decision[3].item() >= 0 else None
+            max_req_value if max_req_value < unset_value else None
         )
         return decision
 

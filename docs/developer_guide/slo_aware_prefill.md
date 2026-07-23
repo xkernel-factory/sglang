@@ -19,8 +19,11 @@
 --slo-prefill-tpot-stat <max|mean|p90>
 --slo-prefill-min-chunk-size <int>
 --slo-prefill-yield-guard-ratio <float>
---disable-slo-prefill-online-cost-model
+--slo-prefill-cost-profile-path <json>
+--slo-prefill-cost-profile-output-path <json>
+--enable-slo-prefill-startup-profiling
 --disable-slo-prefill-startup-profiling
+--slo-prefill-profile-prefill-token-sizes <int...>
 --slo-prefill-profile-decode-context-len <int>
 --slo-prefill-profile-decode-context-lens <int...>
 --slo-prefill-profile-decode-batch-sizes <int...>
@@ -31,7 +34,7 @@
 ```bash
 sglang serve \
   --model-path /path/to/model \
-  --tp 4 \
+  --tp-size 4 \
   --chunked-prefill-size 32768 \
   --enable-slo-aware-prefill \
   --slo-prefill-ttft-slo-ms 15000 \
@@ -49,7 +52,9 @@ sglang serve \
 - `--slo-prefill-ttft-stat` / `--slo-prefill-tpot-stat` 控制 pressure 聚合口径，可选 `max`、`mean`、`p90`。
 - `--slo-prefill-yield-guard-ratio` 是 TTFT slack 安全垫，默认 `0.05`。
 - `--slo-prefill-cache-hit-io-cost-ratio` 是 cache hit token 的 HiCache IO 成本倍率，默认 `0.3`。
-- 启动 cost profiling 默认开启；失败或不支持时回退到初始值或默认成本估计。
+- `--slo-prefill-cost-profile-path` 加载离线生成的 Cp/Cd JSON 表；正式服务只做 CPU 侧表查找/插值，不额外跑 profiling forward。
+- `--slo-prefill-cost-profile-output-path` 只在显式开启 startup profiling 时使用，把采样到的 Cp/Cd 表写出给后续正式服务复用。
+- 启动 cost profiling 默认关闭；SLO 默认只使用 scheduler 公共状态和初始/默认成本估计，避免 synthetic forward 进入模型私有路径。需要离线生成 profile 表时可显式传入 `--enable-slo-prefill-startup-profiling`；失败或不支持时回退到初始值或默认成本估计。
 
 ## 调度流程
 
@@ -152,43 +157,93 @@ guard = max(
 
 ## Cost Profiling
 
-SLO controller 使用两类成本估计：
+SLO controller 使用两类成本估计。默认情况下不会为了建模成本额外构造 synthetic request，也不会在启动阶段额外调用模型 forward，因此 SLO 调度能力不绑定到任何具体模型族：
 
 ```text
 Cp(tokens)                  # prefill token 数 -> prefill forward latency
 Cd(context_len, batch_size)  # decode KV length bucket + batch size -> decode forward latency
 ```
 
-启动 profiling 成功后写入 controller：
+生产推荐使用两阶段模式：
+
+1. 离线生成 profile 表：
+
+```bash
+python3 benchmark/slo_prefill_cost_profiler.py \
+  --output /tmp/slo_prefill_cost_profile.json \
+  -- \
+  --model-path /path/to/model \
+  --tp-size 4 \
+  --chunked-prefill-size 32768 \
+  --slo-prefill-min-chunk-size 4096 \
+  --slo-prefill-profile-prefill-token-sizes 4096 32768 \
+  --slo-prefill-profile-decode-context-lens 4096 8192 16384 32768 \
+  --slo-prefill-profile-decode-batch-sizes 1 2 4 8
+```
+
+该脚本会启动一次服务，自动追加 `--enable-slo-aware-prefill`、`--enable-slo-prefill-startup-profiling` 和 `--slo-prefill-cost-profile-output-path`，等待 JSON 写出后终止服务。
+
+2. 正式服务加载 profile 表：
+
+```bash
+sglang serve \
+  --model-path /path/to/model \
+  --tp-size 4 \
+  --chunked-prefill-size 32768 \
+  --enable-slo-aware-prefill \
+  --slo-prefill-ttft-slo-ms 15000 \
+  --slo-prefill-tpot-slo-ms 60 \
+  --slo-prefill-min-chunk-size 4096 \
+  --slo-prefill-cost-profile-path /tmp/slo_prefill_cost_profile.json
+```
+
+正式服务只读取 JSON 并调用：
 
 ```text
 controller.set_startup_cost_profile(
-  prefill_cost_ms=[(min_chunk_tokens, latency_ms)],
+  prefill_cost_ms=[(tokens, latency_ms), ...],
   decode_cost_by_context_ms=[(context_len, batch_size, latency_ms), ...],
 )
 ```
 
-当前 Cp 只启动采样一个 `min_chunk` 点，并用该点做线性估计。Cd 按 `context_len + batch_size` 二维建模，每个 Cd 点先做 1 次 warmup，再采样 10 次 decode forward 取均值：`context_len` 使用当前 running decode 请求最大 `seqlen`，batch size 使用当前 decode batch size。长上下文 decode 场景建议显式传入多个 context bucket，例如：
+profile JSON schema：
+
+```json
+{
+  "schema_version": 1,
+  "metadata": {"model_path": "/path/to/model", "tp_size": 4},
+  "prefill_cost_ms": [[4096, 12.3], [32768, 91.0]],
+  "decode_cost_ms": [],
+  "decode_cost_by_context_ms": [[4096, 1, 3.1], [4096, 4, 7.8]]
+}
+```
+
+当前 startup profiler 的 Cp 默认只采样一个 `min_chunk` 点；生产离线 profiling 建议通过 `--slo-prefill-profile-prefill-token-sizes` 显式传入多个 token bucket，例如 `4096 32768`。Cd 按 `context_len + batch_size` 二维建模，每个 Cd 点先做 1 次 warmup，再采样 10 次 decode forward 取均值。长上下文 decode 场景建议显式传入多个 context bucket，例如：
 
 ```bash
 --slo-prefill-profile-decode-context-lens 4096 8192 16384 32768
 ```
 
-startup profiling 是 best effort：非 generation、disaggregation、pipeline parallelism、speculative decoding 等场景会跳过；任一采样失败只丢弃该样本并回退初始值或默认成本估计。
+startup profiling 是显式 opt-in 的 best effort 实验能力：非 generation、disaggregation、pipeline parallelism 等场景会跳过；任一采样失败只丢弃该样本并回退初始值或默认成本估计。由于它使用 synthetic request 直接进入模型 forward，正式服务的官方模型兼容性不依赖该路径。
 
 ## TP / DP / HiCache 兼容性
 
 - TP/DP attention 场景同步的是 pressure/cost 输入，而不是 Python decision 对象；同步后各 rank 基于相同输入本地计算相同 decision。
 - DP attention 场景会覆盖 attention TP / CP 相关 group，避免不同 rank 进入不同 forward path。
 - SLO controller 不重排 waiting queue，保留原有 schedule policy / prefix-cache locality 行为。
-- startup profiling 使用 synthetic request，并跳过 radix/cache insert，避免污染线上 prefix/HiCache 状态。
+- 默认 SLO 路径不构造 synthetic request；加载离线 profile 表只读 JSON。显式开启 startup profiling 时才使用 synthetic request，并跳过 radix/cache insert，避免污染线上 prefix/HiCache 状态。
 
 ## 日志
 
 启动成功会看到：
 
 ```text
-SLO-aware prefill enabled: ... startup_profiling=True ...
+SLO-aware prefill enabled: ... startup_profiling=False ...
+```
+
+加载离线 profile 表时会看到 `Loaded SLO prefill cost profile: ...`。显式开启并成功完成 startup profiling 时，还会看到：
+
+```text
 SLO prefill startup cost profile: Cp(ms)=[...], Cd_mean(ms)=[...], Cd_warmup=1, Cd_samples=10
 ```
 
@@ -220,6 +275,8 @@ python3 test/registered/unit/managers/test_slo_aware_prefill.py
 ```bash
 python3 -m py_compile \
   python/sglang/srt/managers/slo_aware_prefill.py \
+  python/sglang/srt/managers/slo_prefill_cost_profile.py \
   python/sglang/srt/managers/scheduler.py \
-  python/sglang/srt/server_args.py
+  python/sglang/srt/server_args.py \
+  benchmark/slo_prefill_cost_profiler.py
 ```

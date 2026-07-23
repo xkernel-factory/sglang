@@ -3804,50 +3804,51 @@ class Scheduler(
         return 10
 
     def _profile_slo_decode_cost(self, batch_size: int, context_len: int) -> float:
+        return self._profile_slo_decode_cost_impl(
+            batch_size=batch_size,
+            context_len=context_len,
+            rid_prefix="decode",
+        )
+
+    def _profile_slo_decode_cost_impl(
+        self, batch_size: int, context_len: int, rid_prefix: str
+    ) -> float:
         reqs = [
-            self._new_slo_profile_req(f"decode-{batch_size}-{i}", context_len)
+            self._new_slo_profile_req(
+                f"{rid_prefix}-{batch_size}-{i}-{context_len}",
+                context_len,
+                max_new_tokens=(
+                    self._slo_decode_profile_warmup_iters()
+                    + self._slo_decode_profile_sample_iters()
+                    + 8
+                ),
+                ignore_eos=True,
+            )
             for i in range(batch_size)
         ]
         try:
             batch = self._new_slo_profile_batch(reqs)
             batch.prepare_for_extend()
             batch = self._prepare_slo_profile_forward_batch(batch)
-            self._run_slo_profile_forward(batch)
-
-            last_tokens = []
-            for req in reqs:
-                token_id = req.origin_input_ids[-1]
-                req.output_ids.append(token_id)
-                req._refresh_fill_ids()
-                last_tokens.append(token_id)
-            bonus_tokens = torch.tensor(
-                last_tokens, dtype=torch.int64, device=self.device
+            _, prefill_result = self._run_slo_profile_forward_result(batch)
+            bonus_tokens = self._apply_slo_profile_prefill_state(
+                batch, prefill_result
             )
-            self.future_map.stash(
-                batch.req_pool_indices, RelayPayload(bonus_tokens=bonus_tokens)
-            )
-            batch.prepare_for_decode()
-            batch = self._prepare_slo_profile_forward_batch(batch)
 
             for _ in range(self._slo_decode_profile_warmup_iters()):
-                self._run_slo_profile_decode_forward(batch, bonus_tokens)
+                _, batch, bonus_tokens = self._run_slo_profile_decode_iteration(
+                    batch, bonus_tokens
+                )
 
-            sample_costs_ms = [
-                self._run_slo_profile_decode_forward(batch, bonus_tokens)
-                for _ in range(self._slo_decode_profile_sample_iters())
-            ]
+            sample_costs_ms = []
+            for _ in range(self._slo_decode_profile_sample_iters()):
+                cost_ms, batch, bonus_tokens = (
+                    self._run_slo_profile_decode_iteration(batch, bonus_tokens)
+                )
+                sample_costs_ms.append(cost_ms)
             return sum(sample_costs_ms) / len(sample_costs_ms)
         finally:
             self._release_slo_profile_reqs(reqs)
-
-    def _run_slo_profile_decode_forward(
-        self, batch: ScheduleBatch, bonus_tokens: torch.Tensor
-    ) -> float:
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=bonus_tokens)
-        )
-        batch.input_ids = None
-        return self._run_slo_profile_forward(batch)
 
     def _slo_profile_verify_num_draft_tokens(self) -> Optional[int]:
         draft_tokens = self.server_args.speculative_num_draft_tokens
@@ -3863,66 +3864,128 @@ class Scheduler(
     ) -> float:
         if self.draft_worker is None:
             raise RuntimeError("Speculative SLO profiling requires draft_worker.")
+        return self._profile_slo_decode_cost_impl(
+            batch_size=batch_size,
+            context_len=context_len,
+            rid_prefix="spec-decode",
+        )
 
-        reqs = [
-            self._new_slo_profile_req(
-                f"spec-decode-{batch_size}-{i}-{context_len}", context_len
+    def _run_slo_profile_decode_iteration(
+        self, batch: ScheduleBatch, bonus_tokens: Optional[torch.Tensor]
+    ) -> Tuple[float, ScheduleBatch, Optional[torch.Tensor]]:
+        """Run one decode iteration with production-shaped state transitions."""
+        batch.prepare_for_decode()
+        batch = self._prepare_slo_profile_forward_batch(batch)
+
+        if batch.spec_algorithm.is_none():
+            assert bonus_tokens is not None
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=bonus_tokens)
             )
-            for i in range(batch_size)
-        ]
-        try:
-            batch = self._new_slo_profile_batch(reqs)
-            batch.prepare_for_extend()
-            batch = self._prepare_slo_profile_forward_batch(batch)
-            _, prefill_result = self._run_slo_profile_forward_result(batch)
-            self._apply_slo_profile_spec_prefill_state(batch, prefill_result)
-            batch.prepare_for_decode()
-            batch = self._prepare_slo_profile_forward_batch(batch)
+            batch.input_ids = None
 
-            for _ in range(self._slo_decode_profile_warmup_iters()):
-                self._run_slo_profile_forward(batch)
+        elapsed_ms, result = self._run_slo_profile_forward_result(batch)
+        if batch.spec_algorithm.is_none():
+            bonus_tokens = self._apply_slo_profile_decode_state(batch, result)
+        else:
+            self._apply_slo_profile_spec_decode_state(batch, result)
+        return elapsed_ms, batch, bonus_tokens
 
-            sample_costs_ms = [
-                self._run_slo_profile_forward(batch)
-                for _ in range(self._slo_decode_profile_sample_iters())
-            ]
-            return sum(sample_costs_ms) / len(sample_costs_ms)
-        finally:
-            self._release_slo_profile_reqs(reqs)
-
-    def _apply_slo_profile_spec_prefill_state(
+    def _apply_slo_profile_prefill_state(
         self, batch: ScheduleBatch, result: GenerationBatchResult
-    ) -> None:
-        if result.next_draft_input is None:
+    ) -> torch.Tensor:
+        if (
+            not batch.spec_algorithm.is_none()
+            and result.next_draft_input is None
+        ):
             raise RuntimeError(
                 "Speculative SLO prefill profiling expected next_draft_input, got None."
             )
         next_token_ids = result.next_token_ids
         if isinstance(next_token_ids, torch.Tensor):
             next_token_ids = next_token_ids.tolist()
+        bonus_token_ids = []
         for i, req in enumerate(batch.reqs):
             token_id = next_token_ids[i]
             if isinstance(token_id, (list, tuple)):
                 req.output_ids.extend(token_id)
+                bonus_token_ids.append(token_id[-1])
             else:
                 req.output_ids.append(token_id)
+                bonus_token_ids.append(token_id)
+            req._refresh_fill_ids()
             if batch.seq_lens_cpu is not None:
                 committed = int(batch.seq_lens_cpu[i])
             else:
                 committed = int(batch.seq_lens[i].item())
             req.kv_committed_len = committed
             req.kv_allocated_len = max(req.kv_allocated_len, committed)
-        batch.spec_info = result.next_draft_input
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = result.next_draft_input
         if result.new_seq_lens is not None:
             batch.seq_lens = result.new_seq_lens
             if batch.seq_lens_cpu is not None:
                 batch.seq_lens_cpu = result.new_seq_lens.cpu()
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None
+        return torch.tensor(
+            bonus_token_ids, dtype=torch.int64, device=self.device
+        )
 
-    def _new_slo_profile_req(self, rid: str, num_tokens: int) -> Req:
+    def _apply_slo_profile_decode_state(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> torch.Tensor:
+        next_token_ids = result.next_token_ids
+        if isinstance(next_token_ids, torch.Tensor):
+            bonus_tokens = next_token_ids.to(device=self.device, dtype=torch.int64)
+            next_token_ids = next_token_ids.tolist()
+        else:
+            bonus_tokens = torch.tensor(
+                next_token_ids, dtype=torch.int64, device=self.device
+            )
+        for req, token_id in zip(batch.reqs, next_token_ids, strict=True):
+            req.output_ids.append(token_id)
+        batch.input_ids = None
+        return bonus_tokens
+
+    def _apply_slo_profile_spec_decode_state(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        self._carry_over_spec_forward_result(batch, result)
+        if batch.seq_lens_cpu is None:
+            committed_lens = batch.seq_lens.tolist()
+        else:
+            committed_lens = batch.seq_lens_cpu.tolist()
+        for req, committed_len in zip(batch.reqs, committed_lens, strict=True):
+            req.kv_committed_len = int(committed_len)
+
+    def _carry_over_spec_forward_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Restore production carry-over after speculative forward isolation."""
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None
+
+    def _new_slo_profile_req(
+        self,
+        rid: str,
+        num_tokens: int,
+        *,
+        max_new_tokens: int = 1,
+        ignore_eos: bool = False,
+    ) -> Req:
         vocab_size = max(int(self.model_config.vocab_size or 32000), 2)
         ids = array("q", ((i % (vocab_size - 1)) + 1 for i in range(num_tokens)))
-        sampling_params = SamplingParams(temperature=0.0, max_new_tokens=1)
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_new_tokens=max_new_tokens,
+            ignore_eos=ignore_eos,
+        )
         req = Req(
             rid=f"__slo_profile_{rid}",
             origin_input_text="",
@@ -3982,7 +4045,7 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
         self._synchronize_slo_profile_device()
         start = time.perf_counter()
-        with torch.inference_mode(), self._forward_isolation(batch, overlap=False):
+        with DynamicGradMode(), self._forward_isolation(batch, overlap=False):
             resolve_forward_inputs(batch, self.future_map)
             result = self.model_worker.forward_batch_generation(batch)
         self._synchronize_slo_profile_device()
@@ -4177,13 +4240,7 @@ class Scheduler(
                     batch_result = self.model_worker.forward_batch_generation(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
+                self._carry_over_spec_forward_result(batch, batch_result)
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
                 batch_result.copy_done = self.device_module.Event()

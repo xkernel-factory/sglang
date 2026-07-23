@@ -1,3 +1,5 @@
+import json
+import tempfile
 import time
 import unittest
 import importlib.util
@@ -14,6 +16,50 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 SloAwarePrefillController = _MODULE.SloAwarePrefillController
 SloAwarePrefillPressureState = _MODULE.SloAwarePrefillPressureState
+
+_PROFILE_MODULE_PATH = (
+    _REPO_ROOT / "python/sglang/srt/managers/slo_prefill_cost_profile.py"
+)
+_PROFILE_SPEC = importlib.util.spec_from_file_location(
+    "slo_prefill_cost_profile", _PROFILE_MODULE_PATH
+)
+_PROFILE_MODULE = importlib.util.module_from_spec(_PROFILE_SPEC)
+assert _PROFILE_SPEC.loader is not None
+sys.modules[_PROFILE_SPEC.name] = _PROFILE_MODULE
+_PROFILE_SPEC.loader.exec_module(_PROFILE_MODULE)
+load_slo_prefill_cost_profile = _PROFILE_MODULE.load_slo_prefill_cost_profile
+write_slo_prefill_cost_profile = _PROFILE_MODULE.write_slo_prefill_cost_profile
+
+
+class TestSloPrefillCostProfile(unittest.TestCase):
+    def test_write_then_load_cost_profile(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = Path(tmp_dir) / "profile.json"
+            write_slo_prefill_cost_profile(
+                str(profile_path),
+                prefill_cost_ms=[(128, 12.5), (1024, 91.0)],
+                decode_cost_ms=[(1, 3.0)],
+                decode_cost_by_context_ms=[(4096, 1, 4.0), (4096, 4, 9.5)],
+                metadata={"model_path": "dummy", "dtype": object()},
+            )
+
+            profile = load_slo_prefill_cost_profile(str(profile_path))
+
+        self.assertEqual(profile.prefill_cost_ms, [(128, 12.5), (1024, 91.0)])
+        self.assertEqual(profile.decode_cost_ms, [(1, 3.0)])
+        self.assertEqual(
+            profile.decode_cost_by_context_ms,
+            [(4096, 1, 4.0), (4096, 4, 9.5)],
+        )
+        self.assertEqual(profile.metadata["model_path"], "dummy")
+        self.assertIsInstance(profile.metadata["dtype"], str)
+
+    def test_empty_cost_profile_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = Path(tmp_dir) / "profile.json"
+            profile_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "at least one cost point"):
+                load_slo_prefill_cost_profile(str(profile_path))
 
 
 class FakeReq:

@@ -181,6 +181,10 @@ from sglang.srt.managers.slo_aware_prefill import (
     SloAwarePrefillController,
     SloAwarePrefillPressureState,
 )
+from sglang.srt.managers.slo_prefill_cost_profile import (
+    load_slo_prefill_cost_profile,
+    write_slo_prefill_cost_profile,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -555,6 +559,7 @@ class Scheduler(
 
         if (
             self.slo_prefill_controller is not None
+            and self.server_args.enable_slo_prefill_startup_profiling
             and not self.server_args.disable_slo_prefill_startup_profiling
         ):
             self._profile_slo_prefill_costs()
@@ -1084,6 +1089,14 @@ class Scheduler(
                     self.server_args.slo_prefill_cache_hit_io_cost_ratio
                 ),
             )
+            if self.server_args.slo_prefill_cost_profile_path is not None:
+                self._load_slo_prefill_cost_profile(
+                    self.server_args.slo_prefill_cost_profile_path
+                )
+            startup_profiling_enabled = (
+                self.server_args.enable_slo_prefill_startup_profiling
+                and not self.server_args.disable_slo_prefill_startup_profiling
+            )
             logger.info(
                 "SLO-aware prefill enabled: "
                 f"ttft_slo_ms={self.server_args.slo_prefill_ttft_slo_ms}, "
@@ -1095,8 +1108,11 @@ class Scheduler(
                 f"{self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k}, "
                 f"initial_decode_cost_ms="
                 f"{self.server_args.slo_prefill_initial_decode_cost_ms}, "
-                f"startup_profiling="
-                f"{not self.server_args.disable_slo_prefill_startup_profiling}, "
+                f"cost_profile_path="
+                f"{self.server_args.slo_prefill_cost_profile_path}, "
+                f"cost_profile_output_path="
+                f"{self.server_args.slo_prefill_cost_profile_output_path}, "
+                f"startup_profiling={startup_profiling_enabled}, "
                 f"profile_decode_context_lens="
                 f"{self._slo_profile_decode_context_lens_arg()}, "
                 f"yield_guard_ratio={self.server_args.slo_prefill_yield_guard_ratio}, "
@@ -3461,6 +3477,75 @@ class Scheduler(
         )
         return decision
 
+    def _load_slo_prefill_cost_profile(self, profile_path: str) -> None:
+        if self.slo_prefill_controller is None:
+            return
+        profile = load_slo_prefill_cost_profile(profile_path)
+        self.slo_prefill_controller.set_startup_cost_profile(
+            prefill_cost_ms=profile.prefill_cost_ms,
+            decode_cost_ms=profile.decode_cost_ms,
+            decode_cost_by_context_ms=profile.decode_cost_by_context_ms,
+        )
+        logger.info(
+            "Loaded SLO prefill cost profile: path=%s, Cp=%s, Cd=%s, metadata=%s",
+            profile_path,
+            [
+                (tokens, round(cost_ms, 3))
+                for tokens, cost_ms in profile.prefill_cost_ms
+            ],
+            self._format_slo_decode_cost_points(profile.decode_cost_by_context_ms),
+            profile.metadata,
+        )
+
+    def _write_slo_prefill_cost_profile(
+        self,
+        *,
+        profile_path: str,
+        prefill_points: List[Tuple[int, float]],
+        decode_points: List[Tuple[int, int, float]],
+    ) -> None:
+        write_slo_prefill_cost_profile(
+            profile_path,
+            prefill_cost_ms=prefill_points,
+            decode_cost_by_context_ms=decode_points,
+            metadata=self._slo_prefill_cost_profile_metadata(),
+        )
+        logger.info("Wrote SLO prefill cost profile: path=%s", profile_path)
+
+    def _slo_prefill_cost_profile_metadata(self) -> Dict[str, Any]:
+        hf_config = getattr(self.model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None)
+        return {
+            "model_path": self.server_args.model_path,
+            "model_architectures": list(architectures or []),
+            "tp_size": self.server_args.tp_size,
+            "dp_size": self.server_args.dp_size,
+            "pp_size": self.server_args.pp_size,
+            "enable_dp_attention": self.server_args.enable_dp_attention,
+            "chunked_prefill_size": self.chunked_prefill_size,
+            "max_prefill_tokens": self.max_prefill_tokens,
+            "slo_prefill_min_chunk_size": (
+                None
+                if self.slo_prefill_controller is None
+                else self.slo_prefill_controller.min_chunk_size
+            ),
+            "slo_prefill_profile_prefill_token_sizes": (
+                self._slo_profile_prefill_sizes_arg()
+            ),
+            "slo_prefill_profile_decode_context_lens": (
+                self._slo_profile_decode_context_lens_arg()
+            ),
+            "slo_prefill_profile_decode_batch_sizes": (
+                self.server_args.slo_prefill_profile_decode_batch_sizes
+            ),
+            "dtype": str(getattr(self.model_config, "dtype", None)),
+            "device": self.server_args.device,
+            "attention_backend": self.server_args.attention_backend,
+            "sampling_backend": self.server_args.sampling_backend,
+            "speculative_algorithm": self.server_args.speculative_algorithm,
+            "quantization": self.server_args.quantization,
+        }
+
     def _profile_slo_prefill_costs(self) -> None:
         if self.slo_prefill_controller is None:
             return
@@ -3484,8 +3569,9 @@ class Scheduler(
         decode_points: List[Tuple[int, int, float]] = []
         try:
             self._warmup_slo_profile_forward()
-            num_tokens = self._slo_profile_prefill_size()
-            if num_tokens > 0:
+            for num_tokens in self._slo_profile_prefill_sizes():
+                if num_tokens <= 0:
+                    continue
                 try:
                     cost_ms = self._profile_slo_prefill_cost(num_tokens)
                 except Exception as exc:
@@ -3539,6 +3625,12 @@ class Scheduler(
             prefill_cost_ms=prefill_points,
             decode_cost_by_context_ms=decode_points,
         )
+        if self.server_args.slo_prefill_cost_profile_output_path is not None:
+            self._write_slo_prefill_cost_profile(
+                profile_path=self.server_args.slo_prefill_cost_profile_output_path,
+                prefill_points=prefill_points,
+                decode_points=decode_points,
+            )
         cd_log = self._format_slo_decode_cost_points(decode_points)
         if not self.spec_algorithm.is_none():
             verify_tokens = self._slo_profile_verify_num_draft_tokens()
@@ -3564,7 +3656,8 @@ class Scheduler(
             )
 
     def _warmup_slo_profile_forward(self) -> None:
-        size = self._slo_profile_prefill_size()
+        sizes = self._slo_profile_prefill_sizes()
+        size = max(sizes) if sizes else 0
         if size <= 0:
             return
         try:
@@ -3577,6 +3670,25 @@ class Scheduler(
         upper = self.slo_prefill_controller.min_chunk_size
         return max(
             1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1)
+        )
+
+    def _slo_profile_prefill_sizes_arg(self) -> List[int]:
+        return self.server_args.slo_prefill_profile_prefill_token_sizes or [
+            self._slo_profile_prefill_size()
+        ]
+
+    def _slo_profile_prefill_sizes(self) -> List[int]:
+        explicit_sizes = self.server_args.slo_prefill_profile_prefill_token_sizes
+        if explicit_sizes is None:
+            return [self._slo_profile_prefill_size()]
+        max_prefill_size = max(
+            1, min(self.max_prefill_tokens, self.max_req_input_len - 1)
+        )
+        return sorted(
+            set(
+                max(1, min(int(num_tokens), max_prefill_size))
+                for num_tokens in explicit_sizes
+            )
         )
 
     def _slo_profile_decode_context_lens_arg(self) -> List[int]:

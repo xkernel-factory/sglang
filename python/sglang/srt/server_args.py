@@ -752,45 +752,10 @@ class ServerArgs:
         Optional[float],
         "Warm-start decode iteration cost for --enable-slo-aware-prefill in milliseconds.",
     ] = None
-    slo_prefill_cost_profile_path: A[
-        Optional[str],
-        (
-            "Path to an offline SLO prefill Cp/Cd cost profile JSON. Loaded at "
-            "startup without running synthetic forward profiling. The profile can "
-            "be generated offline and reused by production serving."
-        ),
-    ] = None
-    slo_prefill_cost_profile_output_path: A[
-        Optional[str],
-        (
-            "Path to write the SLO prefill Cp/Cd cost profile produced by opt-in "
-            "startup synthetic profiling. Intended for offline profiling workflows."
-        ),
-    ] = None
-    enable_slo_prefill_startup_profiling: A[
-        bool,
-        (
-            "Opt in to startup synthetic forward profiling for SLO-aware prefill "
-            "Cp/Cd cost tables. Disabled by default so SLO scheduling stays "
-            "model-agnostic and follows the normal request path for every "
-            "supported model."
-        ),
-    ] = False
     disable_slo_prefill_startup_profiling: A[
         bool,
-        (
-            "Deprecated compatibility switch. If set, disables startup synthetic "
-            "forward profiling even when --enable-slo-prefill-startup-profiling "
-            "is provided."
-        ),
+        "Disable startup forward profiling for SLO-aware prefill Cp/Cd cost tables.",
     ] = False
-    slo_prefill_profile_prefill_token_sizes: A[
-        Optional[List[int]],
-        (
-            "Explicit prefill token sizes for offline/startup SLO Cp profiling. "
-            "Defaults to the effective SLO min chunk size."
-        ),
-    ] = None
     slo_prefill_profile_decode_context_len: A[
         int,
         "Synthetic context length per request for startup SLO decode Cd profiling when context length buckets are not specified.",

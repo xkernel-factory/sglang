@@ -1252,11 +1252,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
-                # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
+                # empty (idle) rank. Hybrid-SSM and selected MoE families take
+                # this path to avoid true zero-token idle ranks; non-hybrid
+                # ranks also reach it once MAX_LEN is forced for the prefill
+                # breakable CUDA graph (idle + prefill), which needs every DP
+                # rank to run the same captured shape. The `else` branch handles
+                # decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (

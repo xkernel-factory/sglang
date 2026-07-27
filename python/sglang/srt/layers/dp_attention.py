@@ -42,6 +42,38 @@ _ATTN_DP_SIZE: Optional[int] = None
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
+_GLM_DSA_NVFP4_IDLE_MAX_LEN_ARCHS = frozenset(
+    {
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    }
+)
+
+
+def _is_glm_dsa_nvfp4_moe_model(model_config: "ModelConfig") -> bool:
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    if not any(arch in _GLM_DSA_NVFP4_IDLE_MAX_LEN_ARCHS for arch in architectures):
+        return False
+
+    quantization = getattr(model_config, "quantization", None)
+    if quantization in {"modelopt_fp4", "modelopt_mixed", "nvfp4_online"}:
+        return True
+    if getattr(model_config, "nvfp4_moe_meta", None) is not None:
+        return True
+
+    quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    if quant_config is not None and not isinstance(quant_config, dict):
+        to_dict = getattr(quant_config, "to_dict", None)
+        if to_dict is None:
+            return False
+        quant_config = to_dict()
+    if not quant_config:
+        return False
+
+    quant_algo = str(quant_config.get("quant_algo", "")).upper()
+    moe_quant_algo = str(quant_config.get("moe_quant_algo", "")).upper()
+    return "NVFP4" in quant_algo or "FP4" in quant_algo or "NVFP4" in moe_quant_algo
+
 
 class DpPaddingMode(IntEnum):
 
@@ -67,7 +99,7 @@ class DpPaddingMode(IntEnum):
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
-            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+            # Some model families materialize idle ranks via the MAX_LEN
             # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
@@ -274,13 +306,24 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     dp = get_flags().dp
-    dp.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
-    moe_dense_tp_size = server_args.moe_dense_tp_size
+    glm_dsa_nvfp4_idle_max_len = (
+        enable_dp_attention
+        and dp_size > 1
+        and _is_glm_dsa_nvfp4_moe_model(model_config)
+    )
+    dp.max_len_with_idle = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+        or glm_dsa_nvfp4_idle_max_len
+    )
     attn_cp_size = server_args.attn_cp_size
+
+    if glm_dsa_nvfp4_idle_max_len:
+        logger.info(
+            "Enable MAX_LEN DP-attention idle padding for GLM DSA NVFP4 MoE to "
+            "avoid zero-token idle ranks in extend MLP sync."
+        )
 
     dp.enabled = enable_dp_attention
 

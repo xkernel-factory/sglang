@@ -9,7 +9,7 @@ from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _domino_config(**overrides):

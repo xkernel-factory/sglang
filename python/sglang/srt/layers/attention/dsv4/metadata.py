@@ -6,6 +6,10 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.logits_budget import (
+    indexer_logits_budget_bytes,
+    paged_logits_rows_per_chunk,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
@@ -74,6 +78,12 @@ def copy_metadata(
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
         if hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
+        elif isinstance(dst_val, list) and isinstance(src_val, list):
+            # Captured kernels retain these tensor addresses. Rebinding a list
+            # leaves graph replays reading the previous forward's plans.
+            assert len(dst_val) == len(src_val), f"{field_name}: chunk count changed"
+            for dst_item, src_item in zip(dst_val, src_val):
+                dst_item.copy_(src_item)
         else:
             warnings.warn(
                 f"{field_name=} {type(dst_val)=} does not have copy_, use setattr"
@@ -116,6 +126,11 @@ class PagedIndexerMetadata:
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    is_prefill: bool = False
+    logits_chunk_rows: int = field(init=False, default=0)
+    chunk_topk_metadata: Optional[List[torch.Tensor]] = field(
+        init=False, repr=False, default=None
+    )
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -144,17 +159,27 @@ class PagedIndexerMetadata:
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
-            if _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
+            num_rows = compressed_seq_lens.shape[0]
+            chunk_rows = max(1, num_rows)
+            if self.is_prefill and not self.use_prefill_cuda_graph:
+                chunk_rows = min(
+                    chunk_rows,
+                    paged_logits_rows_per_chunk(
+                        self.max_compressed_seq_len, indexer_logits_budget_bytes()
+                    ),
+                )
+            if _IS_SM120:
+                chunk_rows = min(chunk_rows, _SM120_INDEXER_M_CHUNK)
+            self.logits_chunk_rows = chunk_rows if num_rows > chunk_rows else 0
+            if num_rows > chunk_rows:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
-                        compressed_seq_lens[_s : _s + _SM120_INDEXER_M_CHUNK],
+                        compressed_seq_lens[_s : _s + chunk_rows],
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
                     )
-                    for _s in range(
-                        0, compressed_seq_lens.shape[0], _SM120_INDEXER_M_CHUNK
-                    )
+                    for _s in range(0, num_rows, chunk_rows)
                 ]
             else:
                 self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
@@ -169,6 +194,15 @@ class PagedIndexerMetadata:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
             self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)
+            if isinstance(self.deep_gemm_metadata, list):
+                self.chunk_topk_metadata = [
+                    plan_topk_v2(
+                        self.compressed_seq_lens[start : start + self.logits_chunk_rows]
+                    )
+                    for start in range(
+                        0, self.compressed_seq_lens.shape[0], self.logits_chunk_rows
+                    )
+                ]
         else:
             self.topk_metadata = torch.empty((0,))
 
@@ -189,7 +223,7 @@ class PagedIndexerMetadata:
         else:
             copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += ["topk_metadata", "chunk_topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
@@ -199,6 +233,8 @@ class PagedIndexerMetadata:
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
+                "is_prefill",
+                "logits_chunk_rows",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
+
+from .logits_budget import indexer_logits_budget_bytes
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -34,10 +35,9 @@ _DECODE_CTA_INFO_WIDTH = 4
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
 # (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
 # independently of context length and chunked-prefill size; smaller budgets only
-# buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
-_LOGITS_BUDGET_ELEMS = (
-    int(os.environ.get("SGLANG_DSV4_FP4_LOGITS_BUDGET_MB", "2048")) * 2**20 // 4
-)
+# buy more row chunks. The neutral INDEXER budget overrides the legacy FP4
+# setting; absent either setting, preserve HIP's existing 2 GiB pool.
+_LOGITS_BUDGET_ELEMS = indexer_logits_budget_bytes(legacy_fp4=True) // 4
 _LOGITS_POOL: dict = {}
 
 

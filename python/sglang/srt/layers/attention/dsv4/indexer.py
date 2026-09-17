@@ -36,7 +36,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
-    _SM120_INDEXER_M_CHUNK,
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
@@ -793,6 +792,7 @@ class C4IndexerBackendMixin:
             pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
             return F.pad(tensor, pad, value=value)
 
+        indexer_metadata = indexer_metadata.for_query_rows(query_rows)
         c4_seq_lens = match_num_queries(
             indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
         )
@@ -849,7 +849,9 @@ class C4IndexerBackendMixin:
 
         all_rows = slice(0, _c4sl.shape[0])
 
-        def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
+        def run_topk_transform(
+            rows: slice, logits: torch.Tensor, chunk_topk_metadata=None
+        ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
             if self.dsa_topk_backend.is_torch():
                 topk_transform_pytorch_vectorized(
@@ -879,9 +881,13 @@ class C4IndexerBackendMixin:
                     # The cached plan routes rows by their index in the full
                     # range, so a chunk needs one built over its own rows.
                     (
-                        indexer_metadata.topk_metadata
-                        if rows == all_rows or not is_hip()
-                        else plan_topk_v2(c4_seq_lens[rows])
+                        chunk_topk_metadata
+                        if chunk_topk_metadata is not None
+                        else (
+                            indexer_metadata.topk_metadata
+                            if rows == all_rows
+                            else plan_topk_v2(c4_seq_lens[rows])
+                        )
                     ),
                     enable_cluster=not is_pdmux_enabled(),
                 )
@@ -957,7 +963,9 @@ class C4IndexerBackendMixin:
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
 
-            def run_paged_indexer(rows: slice, metadata: torch.Tensor) -> None:
+            def run_paged_indexer(
+                rows: slice, metadata: torch.Tensor, chunk_topk_metadata=None
+            ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
                 logits = fn(
                     row_q,
@@ -969,18 +977,22 @@ class C4IndexerBackendMixin:
                     indexer_metadata.max_compressed_seq_len,
                     False,
                 )
-                run_topk_transform(rows, logits)
+                run_topk_transform(rows, logits, chunk_topk_metadata)
 
             deep_gemm_metadata = indexer_metadata.deep_gemm_metadata
             if isinstance(deep_gemm_metadata, list):
-                # SM120 only: DeepGEMM's metadata kernel caps the row count, so
-                # PagedIndexerMetadata split it; run indexer + topk per chunk.
+                # The per-forward plan bounds prefill logits memory and also
+                # preserves SM120's metadata row limit. Reuse it at every layer.
                 num_rows = _c4sl.shape[0]
-                for chunk_idx, start in enumerate(
-                    range(0, num_rows, _SM120_INDEXER_M_CHUNK)
-                ):
-                    rows = slice(start, min(start + _SM120_INDEXER_M_CHUNK, num_rows))
-                    run_paged_indexer(rows, deep_gemm_metadata[chunk_idx])
+                chunk_rows = indexer_metadata.logits_chunk_rows
+                for chunk_idx, start in enumerate(range(0, num_rows, chunk_rows)):
+                    rows = slice(start, min(start + chunk_rows, num_rows))
+                    topk_plan = (
+                        indexer_metadata.chunk_topk_metadata[chunk_idx]
+                        if indexer_metadata.chunk_topk_metadata is not None
+                        else None
+                    )
+                    run_paged_indexer(rows, deep_gemm_metadata[chunk_idx], topk_plan)
             else:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
 

@@ -1524,7 +1524,10 @@ class DeepseekV4AttnBackend(
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
         elif seq_lens_cpu is not None:
-            max_seq_len = int(seq_lens_cpu.max().item())
+            # PDMux split-prefill also runs on idle DP ranks with no requests.
+            # Keep their metadata path for MLP sync, but never reduce an empty
+            # CPU length tensor. An empty batch has no KV sequence to size.
+            max_seq_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
         else:
             max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)

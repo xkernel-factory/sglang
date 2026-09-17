@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import runpy
 import unittest
+from contextlib import nullcontext
 from enum import IntEnum, auto
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,9 +20,15 @@ register_cpu_ci = runpy.run_path(str(ROOT / "python/sglang/test/ci/ci_register.p
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def _load_definitions(path, names, namespace):
+def _load_definitions(path, names, namespace, class_name=None):
     # Load the actual host methods without importing CUDA/Triton dependencies.
     tree = ast.parse(path.read_text(encoding="utf-8"))
+    if class_name is not None:
+        tree = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
     nodes = [
         node
         for node in ast.walk(tree)
@@ -45,6 +52,19 @@ _load_definitions(
 NS["SWA_WINDOW"] = 128
 ForwardMode = NS["ForwardMode"]
 build_metadata = NS["_build_forward_metadata"]
+_load_definitions(
+    ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+    ["init_forward_metadata", "forward"],
+    NS,
+    class_name="DeepseekV4AttnBackend",
+)
+_load_definitions(
+    ROOT / "python/sglang/srt/model_executor/model_runner.py",
+    ["forward_split_prefill"],
+    NS,
+    class_name="ModelRunner",
+)
+NS["device_timer_ctx"] = lambda *args: nullcontext()
 
 
 class TestDSV4EmptyBatchMetadata(unittest.TestCase):
@@ -132,6 +152,92 @@ class TestDSV4EmptyBatchMetadata(unittest.TestCase):
                         ],
                         512 if explicit is None else explicit,
                     )
+
+    def test_idle_init_skips_all_attention_planners_and_clears_stale_state(self):
+        for mtp_enabled in (False, True):
+            with self.subTest(mtp_enabled=mtp_enabled):
+                backend = SimpleNamespace(
+                    mtp_enabled=mtp_enabled,
+                    forward_metadata=object(),
+                    online_c128_mtp=SimpleNamespace(clear=Mock()),
+                    _build_forward_metadata=Mock(
+                        side_effect=AssertionError("idle batch reached planner")
+                    ),
+                    init_forward_metadata_in_graph=Mock(),
+                )
+                batch = self.batch(ForwardMode.IDLE, [])
+                batch._original_forward_mode = ForwardMode.TARGET_VERIFY
+                NS["init_forward_metadata"](backend, batch)
+                self.assertIsNone(backend.forward_metadata)
+                backend.online_c128_mtp.clear.assert_called_once_with()
+                backend._build_forward_metadata.assert_not_called()
+                backend.init_forward_metadata_in_graph.assert_not_called()
+
+    def test_active_init_still_builds_and_materializes_metadata(self):
+        backend = SimpleNamespace(
+            mtp_enabled=False,
+            forward_metadata=None,
+            _build_forward_metadata=Mock(),
+            init_forward_metadata_in_graph=Mock(),
+        )
+        batch = self.batch(ForwardMode.SPLIT_PREFILL, [7])
+        NS["init_forward_metadata"](backend, batch)
+        backend._build_forward_metadata.assert_called_once_with(batch)
+        backend.init_forward_metadata_in_graph.assert_called_once_with(batch)
+        self.assertIs(
+            backend.forward_metadata, backend._build_forward_metadata.return_value
+        )
+
+    def test_idle_attention_does_not_consume_metadata_even_with_padded_queries(self):
+        for mtp_enabled in (False, True):
+            for rows in (0, 8):
+                with self.subTest(mtp_enabled=mtp_enabled, rows=rows):
+                    backend = SimpleNamespace(
+                        mtp_enabled=mtp_enabled, forward_metadata=None
+                    )
+                    q = torch.empty((rows, 2, 16))
+                    output = NS["forward"](
+                        backend,
+                        q,
+                        None,
+                        None,
+                        SimpleNamespace(v_head_dim=32),
+                        self.batch(ForwardMode.IDLE, []),
+                        compress_ratio=4,
+                    )
+                    self.assertEqual(output.shape, (rows, 2, 32))
+                    self.assertEqual(output.dtype, q.dtype)
+                    self.assertEqual(output.device, q.device)
+
+    def test_split_runner_still_executes_idle_model_layers(self):
+        backend = SimpleNamespace(
+            mtp_enabled=False,
+            forward_metadata=object(),
+            online_c128_mtp=SimpleNamespace(clear=Mock()),
+            _build_forward_metadata=Mock(side_effect=AssertionError("idle planner")),
+        )
+        backend.init_forward_metadata = lambda batch: NS["init_forward_metadata"](
+            backend, batch
+        )
+        runner = SimpleNamespace(
+            attn_backend=backend,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+            device_timer=None,
+            model=SimpleNamespace(forward_split_prefill=Mock()),
+        )
+        batch = self.batch(ForwardMode.IDLE, [])
+        batch.input_ids = torch.empty(0, dtype=torch.int64)
+        batch.positions = torch.empty(0, dtype=torch.int64)
+        batch.split_index = 0
+        for interval in ((0, 2), (2, 4)):
+            NS["forward_split_prefill"](
+                runner, batch, reinit_attn_backend=True, forward_count=2
+            )
+            runner.model.forward_split_prefill.assert_called_with(
+                batch.input_ids, batch.positions, batch, interval
+            )
+        self.assertEqual(batch.split_index, 4)
+        self.assertEqual(runner.model.forward_split_prefill.call_count, 2)
 
 
 if __name__ == "__main__":

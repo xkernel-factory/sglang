@@ -164,6 +164,12 @@ class CompressorDecodePlan(NamedTuple):
         ring_size: int,
         use_req_ring: bool = False,
     ) -> CompressorDecodePlan:
+        # An idle DP rank has no rows. CUDA cannot launch a zero-block grid.
+        if req_pool_indices.numel() == 0:
+            return CompressorDecodePlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=req_pool_indices.device),
+            )
         if _is_xpu:
             fn = plan_compress_decode
         else:
@@ -191,6 +197,11 @@ class CompressorDecodePlan(NamedTuple):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
+        if req_pool_indices.numel() == 0:
+            return CompressorDecodePlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=req_pool_indices.device),
+            )
         if _is_xpu:
             fn = plan_compress_decode_legacy
         else:
@@ -208,12 +219,14 @@ class CompressorDecodePlan(NamedTuple):
         state_slot_offset: int = 0,
     ) -> CompressorDecodePlan:
         batch_size = int(seq_lens.shape[0])
-        module = _jit_compress_128_online_module(512)
         plan_d = torch.empty(
             (batch_size, 16),
             dtype=torch.uint8,
             device=req_pool_indices.device,
         )
+        if batch_size == 0:
+            return CompressorDecodePlan(128, plan_d)
+        module = _jit_compress_128_online_module(512)
         module.plan_decode(
             seq_lens,
             req_pool_indices,
@@ -254,26 +267,20 @@ class CompressorPrefillPlan(NamedTuple):
         use_cuda_graph: bool = False,
         use_req_ring: bool = False,
     ) -> CompressorPrefillPlan:
+        # Empty local prefill/TBO batches are valid on every backend. Avoid
+        # both pinned staging allocation and GPU planning when there is no work.
+        if int(num_q_tokens) == 0:
+            return CompressorPrefillPlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=req_to_token.device),
+                torch.empty((0, 8), dtype=torch.uint8, device=req_to_token.device),
+            )
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
             dtype=torch.uint8,
             pin_memory=not is_gpu_input,
         )
-        # DP-safe empty-batch guard: a TBO ubatch (or tail batch) can have 0
-        # query tokens (num_q_tokens==0) on THIS rank while other DP ranks are
-        # non-empty. The global TBO decision must stay uniform across ranks, so
-        # return an empty plan here (downstream compressor then processes 0
-        # tokens = no-op) instead of skipping TBO per-rank. Avoids the
-        # c_plan.cuh RuntimeCheck(batch_size <= num_q_tokens) failure at B>=1.
-        if int(num_q_tokens) == 0 and is_hip():
-            _dev = req_to_token.device
-            return CompressorPrefillPlan(
-                compress_ratio,
-                torch.empty((0, 16), dtype=torch.uint8, device=_dev),
-                torch.empty((0, 8), dtype=torch.uint8, device=_dev),
-                pin_buffer,
-            )
         if _is_xpu:
             fn = plan_compress_prefill
         else:
@@ -317,6 +324,12 @@ class CompressorPrefillPlan(NamedTuple):
         device: torch.device,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
+        if int(num_q_tokens) == 0:
+            return CompressorPrefillPlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=device),
+                torch.empty((0, 8), dtype=torch.uint8, device=device),
+            )
         pin_buffer = torch.empty(
             num_q_tokens * _PREFILL_PLAN_BYTES,
             dtype=torch.uint8,
@@ -354,6 +367,12 @@ class CompressorPrefillPlan(NamedTuple):
         use_cuda_graph: bool = False,
         state_slot_offset: int = 0,
     ) -> CompressorPrefillPlan:
+        if int(num_q_tokens) == 0:
+            return CompressorPrefillPlan(
+                128,
+                torch.empty((0, 16), dtype=torch.uint8, device=req_pool_indices.device),
+                torch.empty((0, 16), dtype=torch.uint8, device=req_pool_indices.device),
+            )
         seq_lens_cpu = seq_lens.detach().to(torch.int64).cpu()
         extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
@@ -405,6 +424,8 @@ def compress_forward(
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
     assert plan.compress_ratio == compress_ratio
+    if kv_score_input.shape[0] == 0:
+        return out
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
         module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
@@ -448,6 +469,8 @@ def compress_norm_rope_store(
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     fp4_k_write_metadata=None,
 ) -> None:
+    if kv.shape[0] == 0:
+        return
     if use_fp4:
         assert kv.shape[-1] == 128
     if is_hip() and use_fp4:

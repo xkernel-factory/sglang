@@ -187,10 +187,39 @@ class SchedulerMultiplexMixin:
             return True, running_batch
         return False, running_batch
 
-    def _get_split_forward_count(self: Scheduler) -> int:
+    def _get_split_forward_count(
+        self: Scheduler, decode_batch: Optional[ScheduleBatch] = None
+    ) -> int:
         remaining_layers = (
             self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
         )
+
+        if self.ps.attn_dp_size > 1:
+            prefill_tokens = self.split_prefill_batch.global_num_tokens
+            decode_tokens = (
+                decode_batch.global_num_tokens if decode_batch is not None else None
+            )
+            if (
+                prefill_tokens is not None
+                and decode_tokens is not None
+                and len(prefill_tokens) == len(decode_tokens) == self.ps.attn_dp_size
+            ):
+                # TP-MoE processes the gathered tokens, not just this DP rank's
+                # chunk. Use its actual total so DP8 at 2048 tokens/rank retains
+                # the same layer budget as TP at 16384 tokens. These counts are
+                # already rank-invariant; no extra CPU collective is needed.
+                # Use ScheduleBatch, not ForwardBatch's padded/rebound counts.
+                total_prefill_tokens = sum(prefill_tokens)
+                if total_prefill_tokens == 0 or not any(decode_tokens):
+                    return remaining_layers
+                return min(
+                    remaining_layers,
+                    max(
+                        1,
+                        self.pdmux_config.split_forward_token_budget
+                        // total_prefill_tokens,
+                    ),
+                )
 
         # Splitting only benefits decode work that can run between prefill
         # intervals. Without decode work, finish prefill in one model call to
@@ -523,7 +552,7 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = self._get_split_forward_count()
+                    forward_count = self._get_split_forward_count(decode_batch)
                     next_split_index = min(
                         self.split_prefill_batch.split_index + forward_count,
                         self.model_config.num_hidden_layers,

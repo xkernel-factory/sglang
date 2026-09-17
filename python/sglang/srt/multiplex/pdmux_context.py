@@ -17,6 +17,8 @@ class PDMuxConfig:
     manual_divisions: List[List[int]] = field(
         default_factory=list
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
+    # Tokens x layers per segment. With DP/TP-MoE, tokens means the gathered
+    # batch total; do not divide this budget by dp_size in the YAML config.
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
     # Overlap mode: prefill keeps its green-context SM cap while decode runs on

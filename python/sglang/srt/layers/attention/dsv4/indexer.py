@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -797,6 +798,20 @@ class C4IndexerBackendMixin:
         )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
+        if (
+            isinstance(indexer_metadata.deep_gemm_metadata, list)
+            and indexer_metadata.is_prefill
+            and not indexer_metadata.use_prefill_cuda_graph
+            and indexer_metadata.compressed_seq_lens.shape[0] != query_rows
+        ):
+            # Chunk schedules encode local row counts/indices. After padding or
+            # cropping queries, rebuild both plans against the actual rows.
+            # Keep the shared forward metadata unchanged for other consumers.
+            indexer_metadata = replace(
+                indexer_metadata,
+                compressed_seq_lens=c4_seq_lens,
+                page_table=page_table,
+            )
         c4_sparse_page_indices = match_num_queries(
             core_metadata.c4_sparse_page_indices, value=-1
         )

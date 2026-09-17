@@ -37,6 +37,66 @@ python -m pytest -q test/registered/unit/layers/test_dsv4_indexer_logits_budget.
 
 GPU validation remains required on the deployment's actual DeepGEMM build:
 
+### Real SM90/SM100 FP8 kernel regression
+
+From the repository root, on an idle NVIDIA GPU with the deployment's
+SGLang/DeepGEMM environment (no model weights needed):
+
+```bash
+PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" CUDA_VISIBLE_DEVICES=0 \
+python test/manual/pdmux/verify_indexer_logits_budget_gpu.py \
+  --output indexer-budget-gpu.json
+```
+
+The default 4 MiB budget deliberately forces small chunks. It is a TEST
+setting, not a recommendation to change the server's 512 MiB default.
+The script executes production row alignment and paged dispatch extracted
+from `indexer.py`, with real metadata planners, DeepGEMM and TopK v1/v2.
+It checks exact chunk boundaries, one-row tails, larger tails, padding across
+a chunk boundary, cropping the tail, and cropping back to a single chunk.
+Only valid logits columns are compared; TopK is checked against torch by
+selected score multiset, allowing equivalent orderings/ties while rejecting
+invalid/duplicate indices or incorrect counts. Tolerance is 1e-4 absolute
+and relative. Any failure exits nonzero; success ends with `PASS`.
+
+This also covers an eager-prefill fallback: if query row alignment changes
+the rows of an existing chunked plan, rebuild the local DeepGEMM and TopK
+plans together. The original shared metadata stays unchanged. Matching row
+counts reuse the existing plan. Decode/graph paths are outside this fallback.
+
+For a larger kernel comparison with the deployment budget:
+
+```bash
+PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" CUDA_VISIBLE_DEVICES=0 \
+python test/manual/pdmux/verify_indexer_logits_budget_gpu.py \
+  --rows 4097 --width 65536 --budget-mb 512 --repeat 20 \
+  --output indexer-budget-gpu-512.json
+```
+
+`width` means compressed context length (65536 corresponds to 262144 original
+tokens). The whole-batch reference needs about 1 GiB of logits in this example;
+use an idle GPU. The script rejects reference sizes exceeding half the reported
+free memory, but this is not a guarantee that all workspaces will fit.
+
+JSON reports kernel time and peak extra allocated memory for whole vs chunked
+execution. `kernel_time_ratio > 1` means chunking took longer for that case.
+Plan wall time includes possible first-use JIT and is diagnostic only. Kernel
+timing is warmed up; metadata preparation is excluded. This is not a full
+model, TP8, HiCache, CUDA Graph or Green Context integration test. The script
+disables TopK v2 cluster dispatch like PDMux, but does not create Green Contexts.
+
+### Service throughput validation
+
+More chunks mean more kernel launches and metadata plans. Smaller budgets can
+reduce GPU work per launch and increase prefill latency; lower allocation
+pressure may offset this under memory stress. No fixed throughput percentage
+can be inferred from this kernel benchmark. Compare identical request data,
+concurrency, prompt/output lengths, warmup and HiCache residency, with repeated
+runs at 512 MiB and (if memory allows) 1024 MiB. Record tokens/s, TTFT p50/p95,
+TPOT p50/p95, errors and peak memory on every rank. Keep the original failing
+revision comparison separate and stop it if it OOMs; an OOM run is not a valid
+steady-state throughput baseline.
+
 1. Compare paged indexer logits/TopK results for a small input under a large
    budget (one chunk) and a small budget (multiple chunks, including a tail).
    Exercise TopK v1/v2 and any selected alternative TopK backend.

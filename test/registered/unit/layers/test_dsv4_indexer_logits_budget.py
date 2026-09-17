@@ -6,6 +6,7 @@ import os
 import sys
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -216,6 +217,64 @@ class TestChunkMetadata(unittest.TestCase):
             np.testing.assert_array_equal(a.value, b.value)
         for a, b in zip(dst.deep_gemm_metadata, src.deep_gemm_metadata):
             np.testing.assert_array_equal(a.value, b.value)
+
+    def test_runtime_padding_and_cropping_rebuild_chunk_plans(self):
+        validator = load(
+            "_dsv4_gpu_validator",
+            "test/manual/pdmux/verify_indexer_logits_budget_gpu.py",
+        )
+        prepare, _ = validator.production_dispatch()
+
+        def pad(tensor, padding, value):
+            widths = list(zip(padding[::2], padding[1::2]))[::-1]
+            return Tensor(np.pad(tensor.value, widths, constant_values=value))
+
+        for target_rows in (2050, 3073, 1025, 1024):
+            with self.subTest(target_rows=target_rows):
+                original = self.make(value=2)
+                ns = dict(
+                    torch=types.SimpleNamespace(Tensor=Tensor),
+                    F=types.SimpleNamespace(pad=pad),
+                    replace=replace,
+                    query_rows=target_rows,
+                    indexer_metadata=original,
+                    use_aiter_fp4=False,
+                )
+                exec(prepare, ns)
+                actual = ns["indexer_metadata"]
+                self.assertEqual(actual.compressed_seq_lens.shape[0], target_rows)
+                self.assertEqual(actual.page_table.shape[0], target_rows)
+                self.assertEqual(original.compressed_seq_lens.shape[0], 2050)
+                if target_rows == 2050:
+                    self.assertIs(actual, original)
+                else:
+                    self.assertIsNot(actual, original)
+                if target_rows > 2050:
+                    np.testing.assert_array_equal(
+                        actual.compressed_seq_lens.value[2050:], 1
+                    )
+                    np.testing.assert_array_equal(actual.page_table.value[2050:], 0)
+                if target_rows <= 1024:
+                    self.assertEqual(actual.logits_chunk_rows, 0)
+                    self.assertIsNone(actual.chunk_topk_metadata)
+                else:
+                    expected = [
+                        min(1024, target_rows - start)
+                        for start in range(0, target_rows, 1024)
+                    ]
+                    self.assertEqual(
+                        [p.shape[0] - 1 for p in actual.chunk_topk_metadata], expected
+                    )
+                    for idx, start in enumerate(range(0, target_rows, 1024)):
+                        length_sum = int(
+                            actual.compressed_seq_lens.value[start : start + 1024].sum()
+                        )
+                        self.assertEqual(
+                            int(actual.deep_gemm_metadata[idx].value[0, 0]), length_sum
+                        )
+                        self.assertEqual(
+                            int(actual.chunk_topk_metadata[idx].value[0, 0]), length_sum
+                        )
 
     def test_indexer_dispatch_matches_whole_topk_and_reuses_plans(self):
         # Execute the production dispatch with deterministic CPU scoring and

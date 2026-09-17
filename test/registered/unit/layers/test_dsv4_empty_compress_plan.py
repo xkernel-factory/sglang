@@ -259,6 +259,45 @@ class TestEmptyCompressPlan(unittest.TestCase):
         )
         module.plan_decode.assert_called_once()
 
+    def test_write_only_prefill_still_updates_compressor_state(self):
+        for online in (False, True):
+            for device in self.devices:
+                with self.subTest(online=online, device=device):
+                    state = torch.zeros((1, 512), device=device)
+                    inputs = torch.ones_like(state)
+                    plan = self.prefill(
+                        128,
+                        torch.empty((0, 16), dtype=torch.uint8, device=device),
+                        torch.zeros(
+                            (1, 16 if online else 8), dtype=torch.uint8, device=device
+                        ),
+                    )
+
+                    def write_tail(buffer, kv_input, out, ape, plan_c, plan_w):
+                        self.assertEqual(plan_c.shape[0], 0)
+                        self.assertEqual(plan_w.shape[0], 1)
+                        buffer.copy_(kv_input)
+
+                    module = SimpleNamespace(prefill=Mock(side_effect=write_tail))
+                    loader = (
+                        "_jit_compress_128_online_module"
+                        if online
+                        else "_jit_compress_module"
+                    )
+                    self.ns[loader] = Mock(return_value=module)
+                    output = self.ns["compress_forward"](
+                        state,
+                        inputs,
+                        torch.zeros_like(inputs),
+                        plan,
+                        head_dim=512,
+                        compress_ratio=128,
+                        is_online=online,
+                    )
+                    self.assertEqual(output.shape, (0, 512))
+                    torch.testing.assert_close(state, inputs)
+                    module.prefill.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

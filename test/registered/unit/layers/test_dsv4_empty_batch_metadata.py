@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from enum import IntEnum, auto
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -196,18 +196,53 @@ class TestDSV4EmptyBatchMetadata(unittest.TestCase):
                         mtp_enabled=mtp_enabled, forward_metadata=None
                     )
                     q = torch.empty((rows, 2, 16))
-                    output = NS["forward"](
-                        backend,
-                        q,
-                        None,
-                        None,
-                        SimpleNamespace(v_head_dim=32),
-                        self.batch(ForwardMode.IDLE, []),
-                        compress_ratio=4,
-                    )
+                    # Poison uninitialized allocations deterministically. MAX_LEN
+                    # DP gather includes padded idle rows in the global MoE input.
+                    with patch.object(
+                        torch.Tensor,
+                        "new_empty",
+                        lambda tensor, *shape: torch.full(
+                            shape,
+                            float("nan"),
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        ),
+                    ):
+                        output = NS["forward"](
+                            backend,
+                            q,
+                            None,
+                            None,
+                            SimpleNamespace(v_head_dim=32),
+                            self.batch(ForwardMode.IDLE, []),
+                            compress_ratio=4,
+                        )
                     self.assertEqual(output.shape, (rows, 2, 32))
                     self.assertEqual(output.dtype, q.dtype)
                     self.assertEqual(output.device, q.device)
+                    torch.testing.assert_close(output, torch.zeros_like(output))
+
+    def test_idle_to_active_rebuilds_metadata_including_padded_extend(self):
+        for mode in (ForwardMode.DECODE, ForwardMode.SPLIT_PREFILL, ForwardMode.EXTEND):
+            with self.subTest(mode=mode):
+                backend = SimpleNamespace(
+                    forward_metadata=object(),
+                    online_c128_mtp=SimpleNamespace(clear=Mock()),
+                    _build_forward_metadata=Mock(),
+                    init_forward_metadata_in_graph=Mock(),
+                )
+                NS["init_forward_metadata"](backend, self.batch(ForwardMode.IDLE, []))
+                batch = self.batch(mode, [7])
+                if mode == ForwardMode.EXTEND:
+                    # MAX_LEN prefill graphs turn IDLE into a dummy EXTEND row.
+                    batch._original_forward_mode = ForwardMode.IDLE
+                NS["init_forward_metadata"](backend, batch)
+                backend._build_forward_metadata.assert_called_once_with(batch)
+                backend.init_forward_metadata_in_graph.assert_called_once_with(batch)
+                self.assertIs(
+                    backend.forward_metadata,
+                    backend._build_forward_metadata.return_value,
+                )
 
     def test_split_runner_still_executes_idle_model_layers(self):
         backend = SimpleNamespace(

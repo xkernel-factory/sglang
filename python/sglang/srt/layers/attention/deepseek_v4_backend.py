@@ -1758,7 +1758,10 @@ class DeepseekV4AttnBackend(
         **_,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+            # MAX_LEN padding can leave nonzero query rows on an idle rank.
+            # Those rows still pass through projections and the DP MoE gather;
+            # keep them finite instead of exposing uninitialized allocator data.
+            return q.new_zeros(q.shape[0], q.shape[1], layer.v_head_dim)
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k

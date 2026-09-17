@@ -195,18 +195,31 @@ class SchedulerMultiplexMixin:
         # Splitting only benefits decode work that can run between prefill
         # intervals. Without decode work, finish prefill in one model call to
         # avoid repeating the full scheduler/model-runner setup per layer.
-        if self.running_batch is None or self.running_batch.is_empty():
-            return remaining_layers
+        forward_count = remaining_layers
+        if (
+            self.running_batch is not None
+            and not self.running_batch.is_empty()
+            and self.split_prefill_batch.extend_num_tokens > 0
+        ):
+            forward_count = min(
+                remaining_layers,
+                max(
+                    1,
+                    self.pdmux_config.split_forward_token_budget
+                    // self.split_prefill_batch.extend_num_tokens,
+                ),
+            )
 
-        if self.split_prefill_batch.extend_num_tokens <= 0:
-            return remaining_layers
-
-        forward_count = max(
-            1,
-            self.pdmux_config.split_forward_token_budget
-            // self.split_prefill_batch.extend_num_tokens,
-        )
-        return min(forward_count, remaining_layers)
+        if self.ps.attn_dp_size > 1:
+            # DP ranks can have different prefill lengths or no local work.
+            # They must yield at the same layer: an early-finishing rank would
+            # otherwise enter the completion collective while its peers start
+            # the next scheduling step. Use the smallest local interval so no
+            # rank exceeds its token budget or skips MLP collectives.
+            count = torch.tensor([forward_count], dtype=torch.int32, device="cpu")
+            self.tp_cpu_group.allreduce(count, dist.ReduceOp.MIN).wait()
+            forward_count = int(count.item())
+        return forward_count
 
     def init_pdmux_prefill_plan_limit(
         self: Scheduler, attn_backend: AttentionBackend

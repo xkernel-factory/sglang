@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, List, Optional
 
 import torch
@@ -136,6 +136,9 @@ class PagedIndexerMetadata:
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
     )
+    _aligned_query_cache: dict[int, PagedIndexerMetadata] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
 
     def __post_init__(self):
         if (
@@ -216,6 +219,36 @@ class PagedIndexerMetadata:
     def max_compressed_seq_len(self) -> int:
         return self.page_table.shape[1] * self.compressed_page_size
 
+    def for_query_rows(self, query_rows: int) -> PagedIndexerMetadata:
+        """Reuse eager-prefill alignment plans across layers of this forward."""
+        if (
+            query_rows == self.compressed_seq_lens.shape[0]
+            or not isinstance(self.deep_gemm_metadata, list)
+            or not self.is_prefill
+            or self.use_prefill_cuda_graph
+        ):
+            return self
+        if query_rows not in self._aligned_query_cache:
+            from torch.nn.functional import pad
+
+            def align(tensor, value):
+                if tensor.shape[0] >= query_rows:
+                    return tensor[:query_rows]
+                padding = (0, 0) * (tensor.dim() - 1) + (
+                    0,
+                    query_rows - tensor.shape[0],
+                )
+                return pad(tensor, padding, value=value)
+
+            # replace reruns __post_init__, building both schedules once for
+            # these rows. Its init=False cache starts empty, without cycles.
+            self._aligned_query_cache[query_rows] = replace(
+                self,
+                compressed_seq_lens=align(self.compressed_seq_lens, 1),
+                page_table=align(self.page_table, 0),
+            )
+        return self._aligned_query_cache[query_rows]
+
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "compressed_seq_lens"]
@@ -224,6 +257,7 @@ class PagedIndexerMetadata:
             copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata", "chunk_topk_metadata"]
+        assign_fields += ["_aligned_query_cache"]
         copy_metadata(
             src=other,
             dst=self,
@@ -240,6 +274,9 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+        # copy_ refreshes this object for another forward. Never reuse (or
+        # clear in place) the source forward's derived alignment cache.
+        self._aligned_query_cache = {}
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

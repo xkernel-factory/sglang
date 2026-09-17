@@ -117,6 +117,10 @@ class TestChunkMetadata(unittest.TestCase):
             self.topk_calls.append(lens.value.copy())
             return Tensor(np.full((lens.shape[0] + 1, 2), int(lens.value.sum())))
 
+        def pad(tensor, padding, value):
+            widths = list(zip(padding[::2], padding[1::2]))[::-1]
+            return Tensor(np.pad(tensor.value, widths, constant_values=value))
+
         envs = types.SimpleNamespace(
             SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=types.SimpleNamespace(get=lambda: False),
             SGLANG_OPT_USE_JIT_INDEXER_METADATA=types.SimpleNamespace(
@@ -124,6 +128,7 @@ class TestChunkMetadata(unittest.TestCase):
             ),
         )
         stubs = {
+            "torch.nn.functional": types.SimpleNamespace(pad=pad),
             "torch": types.SimpleNamespace(
                 Tensor=Tensor,
                 int32=np.int32,
@@ -242,6 +247,12 @@ class TestChunkMetadata(unittest.TestCase):
                 )
                 exec(prepare, ns)
                 actual = ns["indexer_metadata"]
+                plan_count = len(self.dg_calls), len(self.topk_calls)
+                for _ in range(42):
+                    ns["indexer_metadata"] = original
+                    exec(prepare, ns)
+                    self.assertIs(ns["indexer_metadata"], actual)
+                self.assertEqual(plan_count, (len(self.dg_calls), len(self.topk_calls)))
                 self.assertEqual(actual.compressed_seq_lens.shape[0], target_rows)
                 self.assertEqual(actual.page_table.shape[0], target_rows)
                 self.assertEqual(original.compressed_seq_lens.shape[0], 2050)
@@ -275,6 +286,36 @@ class TestChunkMetadata(unittest.TestCase):
                         self.assertEqual(
                             int(actual.chunk_topk_metadata[idx].value[0, 0]), length_sum
                         )
+
+    def test_alignment_cache_is_per_forward_and_per_row_count(self):
+        original = self.make(value=2)
+        first = original.for_query_rows(3073)
+        second = original.for_query_rows(1025)
+        count = len(self.dg_calls), len(self.topk_calls)
+        self.assertIs(original.for_query_rows(3073), first)
+        self.assertIs(original.for_query_rows(1025), second)
+        self.assertEqual(count, (len(self.dg_calls), len(self.topk_calls)))
+        self.assertIsNot(first, second)
+        fresh = self.make(value=3)
+        fresh_aligned = fresh.for_query_rows(3073)
+        self.assertIsNot(fresh_aligned, first)
+        original.copy_(fresh)
+        self.assertEqual(original._aligned_query_cache, {})
+        self.assertIs(fresh.for_query_rows(3073), fresh_aligned)
+        rebuilt = original.for_query_rows(3073)
+        self.assertIsNot(rebuilt, first)
+        self.assertIsNot(rebuilt, fresh_aligned)
+        np.testing.assert_array_equal(rebuilt.compressed_seq_lens.value[:2050], 3)
+        np.testing.assert_array_equal(rebuilt.compressed_seq_lens.value[2050:], 1)
+
+    def test_alignment_leaves_graph_and_decode_metadata_unchanged(self):
+        self.metadata._IS_SM120 = True
+        for prefill, graph in ((False, False), (True, True)):
+            m = self.make(rows=5000, prefill=prefill, graph=graph)
+            count = len(self.dg_calls), len(self.topk_calls)
+            self.assertIs(m.for_query_rows(4097), m)
+            self.assertEqual(m._aligned_query_cache, {})
+            self.assertEqual(count, (len(self.dg_calls), len(self.topk_calls)))
 
     def test_indexer_dispatch_matches_whole_topk_and_reuses_plans(self):
         # Execute the production dispatch with deterministic CPU scoring and

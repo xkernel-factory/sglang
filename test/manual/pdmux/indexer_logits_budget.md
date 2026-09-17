@@ -62,7 +62,13 @@ and relative. Any failure exits nonzero; success ends with `PASS`.
 This also covers an eager-prefill fallback: if query row alignment changes
 the rows of an existing chunked plan, rebuild the local DeepGEMM and TopK
 plans together. The original shared metadata stays unchanged. Matching row
-counts reuse the existing plan. Decode/graph paths are outside this fallback.
+counts reuse the existing plan. Aligned tensors and plans are cached on the
+source metadata by query row count and shared across indexer layers of the
+same forward. A new metadata object starts with an empty cache; `copy_`
+invalidates the destination cache without sharing the source cache. The
+CPU regression simulates 43 layer calls and checks both reuse and invalidation.
+Decode/graph paths are outside this fallback. The fused KV cache is passed as
+`uint8` bytes, matching production and DeepGEMM's dtype contract.
 
 For a larger kernel comparison with the deployment budget:
 

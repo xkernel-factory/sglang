@@ -132,7 +132,8 @@ def main():
         ),
         dim=1,
     )
-    cache = cache.view(torch.float8_e4m3fn).reshape(pages, 64, 1, 132)
+    # Fused FP8 values and FP32 scales are passed as bytes, like production.
+    cache = cache.reshape(pages, 64, 1, 132)
     report = {
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
@@ -255,6 +256,8 @@ def main():
             torch.cuda.synchronize()
             plan_ms = (time.perf_counter() - t0) * 1000
             final = ns["indexer_metadata"]
+            for _ in range(42):
+                assert m.for_query_rows(actual_rows) is final, "Plan rebuilt across layers"
             with patch.dict(
                 os.environ, {"SGLANG_DSV4_INDEXER_LOGITS_BUDGET_MB": "65536"}
             ):
